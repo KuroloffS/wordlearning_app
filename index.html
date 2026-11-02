@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WordLearning</title>
+  <meta name="description" content="Learn words with spaced repetition: each word comes back for review at growing intervals." />
+  <meta name="theme-color" content="#4f46e5" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#study"><img src="icon.svg" alt="" width="28" height="28" /> WordLearning</a>
+    <nav class="tabs" aria-label="Main">
+      <a href="#study" data-view="study">Study <span class="badge" id="due-badge" hidden>0</span></a>
+      <a href="#words" data-view="words">Words</a>
+      <a href="#add" data-view="add">Add</a>
+      <a href="#stats" data-view="stats">Stats</a>
+      <a href="#settings" data-view="settings">Settings</a>
+    </nav>
+  </header>
+
+  <main>
+    <!-- STUDY -->
+    <section id="view-study" class="view">
+      <div id="study-home">
+        <div class="hero card">
+          <div class="hero-counts">
+            <div><span class="big" id="count-due">0</span><span>to review</span></div>
+            <div><span class="big" id="count-new">0</span><span>new today</span></div>
+            <div><span class="big" id="count-total">0</span><span>words total</span></div>
+          </div>
+          <p class="muted" id="next-due-text"></p>
+          <div class="row">
+            <label>Deck
+              <select id="study-deck"></select>
+            </label>
+            <label>Mode
+              <select id="study-mode">
+                <option value="flip">Flashcards</option>
+                <option value="type">Type the answer</option>
+                <option value="choice">Multiple choice</option>
+              </select>
+            </label>
+            <label>Direction
+              <select id="study-direction">
+                <option value="forward">Word → Translation</option>
+                <option value="reverse">Translation → Word</option>
+                <option value="mixed">Mixed</option>
+              </select>
+            </label>
+          </div>
+          <div class="row">
+            <button class="primary big-btn" id="start-btn">Start</button>
+            <button class="ghost" id="cram-btn" title="Practice all words in this deck without changing their schedule">Free practice</button>
+          </div>
+        </div>
+        <div class="card empty-hint" id="empty-hint" hidden>
+          <h2>No words yet</h2>
+          <p>Add a few words to start. Each word you learn comes back for review after
+            10 minutes, then 1 day, 3 days, 1 week, 2 weeks, 1 month… — always right before you would forget it.</p>
+          <div class="row"><a class="button primary" href="#add">Add words</a>
+            <button class="ghost" id="sample-btn">Load sample words</button></div>
+        </div>
+      </div>
+
+      <div id="session" hidden>
+        <div class="session-top">
+          <button class="ghost" id="end-session">✕ End</button>
+          <div class="progress"><div id="progress-bar"></div></div>
+          <span class="muted" id="session-left"></span>
+        </div>
+        <div class="flashcard card" id="flashcard">
+          <div class="tag-row"><span class="tag" id="card-tag"></span><button class="icon-btn" id="speak-btn" title="Pronounce (S)">🔊</button></div>
+          <div class="prompt" id="card-prompt"></div>
+          <div class="answer" id="card-answer" hidden></div>
+          <div class="example muted" id="card-example" hidden></div>
+
+          <form id="type-form" hidden autocomplete="off">
+            <input id="type-input" type="text" placeholder="Type the answer…" autocapitalize="off" spellcheck="false" />
+            <button class="primary" type="submit">Check</button>
+          </form>
+          <div class="feedback" id="feedback" hidden></div>
+          <div class="choices" id="choices" hidden></div>
+        </div>
+
+        <div class="controls">
+          <button class="primary big-btn" id="show-btn">Show answer <kbd>Space</kbd></button>
+          <div class="grades" id="grades" hidden>
+            <button data-grade="0" class="g-again">Again<small></small></button>
+            <button data-grade="1" class="g-hard">Hard<small></small></button>
+            <button data-grade="2" class="g-good">Good<small></small></button>
+            <button data-grade="3" class="g-easy">Easy<small></small></button>
+          </div>
+        </div>
+        <p class="muted center hint">Keys: <kbd>Space</kbd> show · <kbd>1</kbd>–<kbd>4</kbd> grade · <kbd>Enter</kbd> suggested grade · <kbd>S</kbd> speak</p>
+      </div>
+
+      <div id="session-done" class="card center" hidden>
+        <h2>🎉 Done for now</h2>
+        <p id="done-summary"></p>
+        <p class="muted" id="done-next"></p>
+        <button class="primary" id="done-btn">Back</button>
+      </div>
+    </section>
+
+    <!-- WORDS -->
+    <section id="view-words" class="view" hidden>
+      <div class="card">
+        <div class="row wrap">
+          <input id="search" type="search" placeholder="Search words…" />
+          <select id="filter-deck"></select>
+          <select id="filter-status">
+            <option value="">All statuses</option>
+            <option value="new">New</option>
+            <option value="learning">Learning</option>
+            <option value="known">Known</option>
+            <option value="mastered">Mastered</option>
+            <option value="due">Due now</option>
+          </select>
+        </div>
+        <p class="muted" id="words-count"></p>
+        <div class="table-wrap">
+          <table class="words">
+            <thead><tr><th>Word</th><th>Translation</th><th>Status</th><th>Next review</th><th></th></tr></thead>
+            <tbody id="words-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Decks</h3>
+        <ul id="deck-list" class="deck-list"></ul>
+        <form id="deck-form" class="row">
+          <input id="deck-name" placeholder="New deck name" required />
+          <button class="primary" type="submit">Add deck</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- ADD -->
+    <section id="view-add" class="view" hidden>
+      <div class="card">
+        <h2>Add a word</h2>
+        <form id="add-form" class="stack">
+          <label>Word <input id="add-word" required /></label>
+          <label>Translation <small class="muted">(several variants: separate with , or /)</small>
+            <input id="add-translation" required /></label>
+          <label>Example sentence <small class="muted">(optional)</small><input id="add-example" /></label>
+          <label>Deck <select id="add-deck"></select></label>
+          <button class="primary" type="submit">Add</button>
+          <p class="muted" id="add-msg" role="status"></p>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Bulk import</h2>
+        <p class="muted">One word per line: <code>word - translation - example</code>. Tab, “ - ”, “=”, “;” or “,” work as separators. You can paste straight from a spreadsheet.</p>
+        <form id="bulk-form" class="stack">
+          <textarea id="bulk-text" rows="8" placeholder="apple - яблоко&#10;to borrow - занимать - Can I borrow your pen?"></textarea>
+          <label>Deck <select id="bulk-deck"></select></label>
+          <button class="primary" type="submit">Import</button>
+          <p class="muted" id="bulk-msg" role="status"></p>
+        </form>
+      </div>
+    </section>
+
+    <!-- STATS -->
+    <section id="view-stats" class="view" hidden>
+      <div class="stat-grid" id="stat-grid"></div>
+      <div class="card">
+        <h3>Reviews coming up (next 7 days)</h3>
+        <div class="bars" id="forecast"></div>
+      </div>
+      <div class="card">
+        <h3>Last 14 days</h3>
+        <div class="bars" id="history"></div>
+      </div>
+      <div class="card">
+        <h3>Words by stage</h3>
+        <div class="bars" id="stages"></div>
+      </div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="view-settings" class="view" hidden>
+      <div class="card">
+        <h2>Settings</h2>
+        <form id="settings-form" class="stack">
+          <label>Repetition intervals
+            <input id="set-intervals" />
+            <small class="muted">After each correct answer a word moves one step to the right. Units: m, h, d, w, mo, y.</small>
+          </label>
+          <label>New words per day <input id="set-newperday" type="number" min="0" max="500" /></label>
+          <label>Pronunciation language
+            <select id="set-lang"></select>
+          </label>
+          <label class="check"><input id="set-autospeak" type="checkbox" /> Pronounce word automatically</label>
+          <label class="check"><input id="set-notify" type="checkbox" /> Notify me when words are due (while this tab is open)</label>
+          <label>Theme
+            <select id="set-theme">
+              <option value="auto">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <button class="primary" type="submit">Save</button>
+          <p class="muted" id="settings-msg" role="status"></p>
+        </form>
+      </div>
+      <div class="card">
+        <h3>Backup</h3>
+        <div class="row wrap">
+          <button id="export-btn">Export JSON</button>
+          <button id="export-csv-btn">Export CSV</button>
+          <label class="button">Import JSON<input id="import-file" type="file" accept="application/json,.json" hidden /></label>
+          <button class="danger" id="reset-btn">Delete all data</button>
+        </div>
+        <p class="muted" id="backup-msg" role="status"></p>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="edit-dialog">
+    <form method="dialog" id="edit-form" class="stack">
+      <h3>Edit word</h3>
+      <label>Word <input id="edit-word" required /></label>
+      <label>Translation <input id="edit-translation" required /></label>
+      <label>Example <input id="edit-example" /></label>
+      <label>Deck <select id="edit-deck"></select></label>
+      <div class="row">
+        <button value="save" class="primary">Save</button>
+        <button value="reset" type="submit" class="ghost" title="Start learning this word from scratch">Reset progress</button>
+        <button value="cancel" formnovalidate class="ghost">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
