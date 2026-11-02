@@ -60,3 +60,7 @@ js/app.js           UI logic: study sessions, word list, stats, settings
 sw.js               offline cache
 tests/srs.test.js   scheduler tests (node --test)
 ```
+
+## Telegram bot
+
+The `bot/` folder has a Telegram version that stores data in Supabase and sends reminders when words are due. See [bot/README.md](bot/README.md).
