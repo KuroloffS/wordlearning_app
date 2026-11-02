@@ -1,0 +1,10 @@
+{
+  "name": "WordLearning",
+  "short_name": "Words",
+  "description": "Learn words with spaced repetition",
+  "start_url": "./#study",
+  "display": "standalone",
+  "background_color": "#f5f6fa",
+  "theme_color": "#4f46e5",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
