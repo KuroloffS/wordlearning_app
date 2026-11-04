@@ -12,9 +12,16 @@ function toCard(row) {
   return { ...row, due: ms(row.due), created_at: ms(row.created_at), last_reviewed: ms(row.last_reviewed) };
 }
 
+// The interface language lives in the column ui_lang ('ru' | 'de'); the bot calls it `lang`.
 function toUser(row) {
   if (!row) return null;
-  return { ...row, last_active_at: ms(row.last_active_at), last_notified_at: ms(row.last_notified_at), created_at: ms(row.created_at) };
+  return {
+    ...row,
+    lang: row.ui_lang ?? 'ru',
+    last_active_at: ms(row.last_active_at),
+    last_notified_at: ms(row.last_notified_at),
+    created_at: ms(row.created_at),
+  };
 }
 
 function check({ data, error, count }) {
@@ -34,12 +41,12 @@ export function createSupabaseDb(url, serviceKey) {
     /** Creates the user on first contact (with default language settings) or refreshes name/activity. */
     async touchUser(from, now, defaults = {}) {
       const row = check(
-        await sb.rpc('touch_user', {
+        await sb.rpc('touch_user_v3', {
           p_id: from.id,
           p_username: from.username ?? null,
           p_first_name: from.first_name ?? null,
           p_language_code: from.language_code ?? null,
-          p_lang: defaults.lang ?? 'ru',
+          p_ui_lang: defaults.lang ?? 'ru',
           p_learn: defaults.learn ?? 'de',
           p_tz_offset_min: defaults.tz_offset_min ?? 300,
           p_now: iso(now),
@@ -54,6 +61,10 @@ export function createSupabaseDb(url, serviceKey) {
 
     async updateUser(id, patch) {
       const p = { ...patch };
+      if ('lang' in p) {
+        p.ui_lang = p.lang;
+        delete p.lang;
+      }
       for (const k of ['last_active_at', 'last_notified_at']) if (typeof p[k] === 'number') p[k] = iso(p[k]);
       check(await sb.from('users').update(p).eq('id', id));
     },
