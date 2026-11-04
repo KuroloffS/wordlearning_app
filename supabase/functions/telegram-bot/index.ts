@@ -11,7 +11,7 @@
 //
 // The code in ./lib is generated from bot/src and js/srs.js by `npm run build:edge` (in bot/).
 // deno-lint-ignore-file no-explicit-any
-import { webhookCallback } from 'grammy';
+import { InputFile, webhookCallback } from 'grammy';
 import { createBot } from './lib/bot.js';
 import { createSupabaseDb } from './lib/db/supabase.js';
 import { enrichCards, sendReminders } from './lib/reminders.js';
@@ -19,7 +19,7 @@ import { ensureWebhook } from './lib/setup.js';
 import { createTranslator } from './lib/translate.js';
 import { createAudioFetcher, createDictionary } from './lib/dictionary.js';
 
-const VERSION = '2026-11-04.3';
+const VERSION = '2026-11-04.5';
 const FUNCTION_NAME = 'telegram-bot';
 const SUPABASE_URL = (Deno.env.get('SUPABASE_URL') ?? '').replace(/\/+$/, '');
 const WEBHOOK_URL = Deno.env.get('WEBHOOK_URL') ?? `${SUPABASE_URL}/functions/v1/${FUNCTION_NAME}`;
@@ -135,6 +135,18 @@ const TEST_BOT_INFO = {
   has_main_web_app: false,
 };
 
+/** Uploads can't be turned into JSON (grammY forbids it): the simulation reports their name and size instead. */
+function describeFiles(payload: any): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...payload };
+  for (const [key, value] of Object.entries(out)) {
+    if (value instanceof InputFile) {
+      const data = (value as any).fileData;
+      out[key] = { input_file: value.filename ?? null, bytes: data instanceof Uint8Array ? data.length : null };
+    }
+  }
+  return out;
+}
+
 /** Runs updates through the real bot code and database with a fake Telegram API. Test users only. */
 async function simulate(body: any) {
   const updates: any[] = Array.isArray(body?.updates) ? body.updates : [];
@@ -152,11 +164,18 @@ async function simulate(body: any) {
     onError: (err: any) => errors.push(String(err?.error?.stack ?? err?.error ?? err)),
   });
   let messageId = 1000;
+  // deno-lint-ignore require-await -- grammY transformers must return a promise
   bot.api.config.use((async (_prev: unknown, method: string, payload: any) => {
-    calls.push({ method, payload });
-    const result = method.startsWith('send')
-      ? { message_id: ++messageId, date: Math.floor(Date.now() / 1000), chat: { id: payload.chat_id, type: 'private' }, text: payload.text }
-      : true;
+    calls.push({ method, payload: describeFiles(payload) });
+    if (!method.startsWith('send')) return { ok: true, result: true };
+    const result: Record<string, unknown> = {
+      message_id: ++messageId,
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: payload.chat_id, type: 'private' },
+      text: payload.text,
+    };
+    // Like Telegram, answer an uploaded voice message with its file id, so the bot's caching of it is exercised too.
+    if (method === 'sendVoice') result.voice = { file_id: `simulated-voice-${messageId}`, file_unique_id: `sim${messageId}`, duration: 1 };
     return { ok: true, result };
   }) as any);
   for (const u of updates) await bot.handleUpdate(u);

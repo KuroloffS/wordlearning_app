@@ -54,7 +54,7 @@ test('due reviews come before new words; daily limit for new words', async () =>
   await h.press(h.buttons(h.last())[0]);
   await h.press(h.buttons(h.last('editMessageText'))[2]);
   assert.match(h.last().text, /На сейчас всё/);
-  assert.match(h.last().text, /Дневной лимит новых слов \(1\) выполнен\. Ещё 2 ждут завтра/);
+  assert.match(h.last().text, /Дневной лимит новых слов \(1\) выполнен\. Ещё 2 слова ждут завтра/);
   assert.match(h.last().text, /Следующее повторение через <b>10 мин<\/b>/);
 
   h.clock.now += 11 * MINUTE;

@@ -63,10 +63,10 @@ tests/srs.test.js   scheduler tests (node --test)
 
 ## Telegram bot
 
-The `bot/` folder has the Telegram version, which is **deployed and running on Supabase**:
+The `bot/` folder has the Telegram version, a **German ↔ Russian** trainer that is **live on Supabase**:
 - an Edge Function with a webhook;
 - a scheduled job that sends reminders when words are due;
-- an interface in Uzbek, Russian and English;
-- automatic translation and pronunciation for new words.
+- a Russian or German interface, and you learn either German or Russian;
+- for every new word, the translation, the article (der/die/das), the IPA and a native recording, all looked up automatically from German Wiktionary and Wikimedia Commons.
 
-The only remaining step is adding the `BOT_TOKEN` secret. See [bot/README.md](bot/README.md).
+See [bot/README.md](bot/README.md).

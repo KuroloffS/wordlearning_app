@@ -61,10 +61,30 @@ test('language detection, plurals, intervals', () => {
   assert.equal(fmtInterval('de', 3 * 86400000), '3 Tg.');
 });
 
+test('sentences agree with the number of words', () => {
+  assert.match(t('de', 'reminder', 1), /<b>1<\/b> Wort wartet auf dich\.\n\nWiederhole es jetzt, bevor du es vergisst/);
+  assert.match(t('de', 'reminder', 3), /<b>3<\/b> Wörter warten auf dich\.\n\nWiederhole sie jetzt, bevor du sie vergisst/);
+  assert.match(t('ru', 'reminder', 1), /Повторите его сейчас/);
+  assert.match(t('ru', 'reminder', 21), /Повторите их сейчас/);
+  assert.match(t('ru', 'limit_reached', 20, 1, 'X'), /Ещё 1 слово ждёт завтра/);
+  assert.match(t('ru', 'limit_reached', 20, 5, 'X'), /Ещё 5 слов ждут завтра/);
+  assert.match(t('de', 'limit_reached', 20, 1, 'X'), /Ein weiteres Wort wartet auf morgen/);
+  assert.match(t('de', 'limit_reached', 20, 5, 'X'), /5 weitere Wörter warten auf morgen/);
+  assert.match(t('ru', 'too_many', 501, 500), /Здесь 501 строка/);
+  assert.match(t('ru', 'too_many', 600, 500), /Здесь 600 строк/);
+});
+
 test('sample words are German ↔ Russian in both directions', () => {
   assert.equal(SAMPLE_PAIRS.length, 12);
   assert.deepEqual(samplesFor('de')[0], { word: 'das Haus', translation: 'дом', example: 'Das Haus ist groß.' });
   assert.deepEqual(samplesFor('ru')[0], { word: 'дом', translation: 'das Haus', example: 'Дом большой.' });
+});
+
+test('help credits the dictionary and the recordings', () => {
+  for (const lang of LANGS) {
+    assert.match(t(lang, 'help'), /de\.wiktionary\.org.*commons\.wikimedia\.org.*CC BY-SA/s);
+    assert.ok(t(lang, 'greet', 'X').length + t(lang, 'help').length < 4096, 'the /start message must fit in one Telegram message');
+  }
 });
 
 test('user input is HTML-escaped', () => {

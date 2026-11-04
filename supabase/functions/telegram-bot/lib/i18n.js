@@ -102,7 +102,9 @@ ${intervalsLine('ru')}
 
 🔔 Я напомню, когда пора повторять.
 
-/list – мои слова · /find – поиск и правка · /stats – прогресс · /settings – настройки · /export – экспорт`,
+/list – мои слова · /find – поиск и правка · /stats – прогресс · /settings – настройки · /export – экспорт
+
+📖 Словарь и произношение: <a href="https://de.wiktionary.org">Викисловарь</a> и <a href="https://commons.wikimedia.org">Wikimedia Commons</a> (CC BY-SA).`,
     de: () => `<b>So funktioniert es</b>
 
 1️⃣ Schick mir ein Wort – auf Russisch oder Deutsch – und ich finde selbst die Übersetzung und die Aussprache:
@@ -122,7 +124,9 @@ ${intervalsLine('de')}
 
 🔔 Ich erinnere dich, wenn es Zeit zum Wiederholen ist.
 
-/list – meine Wörter · /find – suchen &amp; bearbeiten · /stats – Fortschritt · /settings – Einstellungen · /export – Export`,
+/list – meine Wörter · /find – suchen &amp; bearbeiten · /stats – Fortschritt · /settings – Einstellungen · /export – Export
+
+📖 Wörterbuch und Aussprache: <a href="https://de.wiktionary.org">Wiktionary</a> und <a href="https://commons.wikimedia.org">Wikimedia Commons</a> (CC BY-SA).`,
   },
   first_words: {
     ru: 'Отправьте мне первые слова или попробуйте примеры 👇',
@@ -164,7 +168,7 @@ Du kannst bis zu ${max} Zeilen auf einmal senden, z. B. zwei Spalten aus Excel.`
     de: 'Ich habe keine Wörter gefunden. Schick ein Wort oder <code>Wort - Übersetzung</code>, eins pro Zeile.\n\nBeispiel:\n<code>кошка - die Katze</code>',
   },
   too_many: {
-    ru: (n, max) => `Здесь ${n} строк — отправляйте не больше ${max} за раз.`,
+    ru: (n, max) => `Здесь ${n} ${ruPlural(n, 'строка', 'строки', 'строк')} — отправляйте не больше ${max} за раз.`,
     de: (n, max) => `Das sind ${n} Zeilen – bitte schick höchstens ${max} auf einmal.`,
   },
   added_n: {
@@ -225,8 +229,10 @@ Du kannst bis zu ${max} Zeilen auf einmal senden, z. B. zwei Spalten aus Excel.`
   },
   all_done: { ru: '🎉 <b>На сейчас всё!</b>', de: '🎉 <b>Für jetzt alles erledigt!</b>' },
   limit_reached: {
-    ru: (limit, waiting, settings) => `Дневной лимит новых слов (${limit}) выполнен. Ещё ${waiting} ждут завтра — лимит можно изменить в разделе «${settings}».`,
-    de: (limit, waiting, settings) => `Tageslimit für neue Wörter (${limit}) erreicht. ${waiting} weitere warten auf morgen – das Limit kannst du unter „${settings}“ ändern.`,
+    ru: (limit, waiting, settings) =>
+      `Дневной лимит новых слов (${limit}) выполнен. Ещё ${count('ru', 'word', waiting)} ${ruPlural(waiting, 'ждёт', 'ждут', 'ждут')} завтра — лимит можно изменить в разделе «${settings}».`,
+    de: (limit, waiting, settings) =>
+      `Tageslimit für neue Wörter (${limit}) erreicht. ${waiting === 1 ? 'Ein weiteres Wort wartet' : `${waiting} weitere Wörter warten`} auf morgen – das Limit kannst du unter „${settings}“ ändern.`,
   },
   next_review_in: {
     ru: (iv) => `⏰ Следующее повторение через <b>${iv}</b> — я напомню.`,
@@ -418,8 +424,11 @@ Genaue Zeitzone: <code>/timezone +5:30</code>`,
 
   // ---------- reminders ----------
   reminder: {
-    ru: (n) => `🔔 Пора повторить! Слов на повторение: <b>${n}</b>.\n\nПовторите их сейчас, пока не забыли 🧠`,
-    de: (n) => `🔔 Zeit zum Wiederholen! <b>${n}</b> ${n === 1 ? 'Wort wartet' : 'Wörter warten'} auf dich.\n\nWiederhole sie jetzt, bevor du sie vergisst 🧠`,
+    ru: (n) => `🔔 Пора повторить! Слов на повторение: <b>${n}</b>.\n\nПовторите ${n === 1 ? 'его' : 'их'} сейчас, пока не забыли 🧠`,
+    de: (n) => {
+      const it = n === 1 ? 'es' : 'sie';
+      return `🔔 Zeit zum Wiederholen! <b>${n}</b> ${n === 1 ? 'Wort wartet' : 'Wörter warten'} auf dich.\n\nWiederhole ${it} jetzt, bevor du ${it} vergisst 🧠`;
+    },
   },
   btn_start_review: { ru: '▶️ Начать повторение', de: '▶️ Wiederholung starten' },
 

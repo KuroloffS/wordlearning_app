@@ -1,7 +1,7 @@
 {
   "name": "wordlearning-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for learning words with spaced repetition (Supabase storage)",
+  "description": "Telegram bot for learning German ↔ Russian words with spaced repetition (Supabase)",
   "private": true,
   "type": "module",
   "main": "src/index.js",
