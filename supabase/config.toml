@@ -1,0 +1,7 @@
+# Supabase CLI settings for this repository (everything not listed uses the CLI defaults).
+project_id = "wordlearning_app"
+
+[functions.telegram-bot]
+# Telegram and the scheduled job cannot send a Supabase JWT; the function checks its own secrets.
+verify_jwt = false
+import_map = "./functions/telegram-bot/deno.json"

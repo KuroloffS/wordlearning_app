@@ -1,2 +1,4 @@
 node_modules/
 .env
+# created by local Deno runs; Supabase resolves the pinned versions in deno.json
+supabase/functions/**/deno.lock

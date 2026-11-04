@@ -11,25 +11,51 @@ const USER_DEFAULTS = {
   tz_offset_min: 300,
   quiet_start: 23,
   quiet_end: 8,
+  lang: 'en',
+  translate_to: null,
   pending: null,
   last_active_at: null,
   last_notified_at: null,
 };
 
 const localDate = (t, off) => new Date(t + off * MINUTE).toISOString().slice(0, 10);
+const localHour = (t, off) => new Date(t + off * MINUTE).getUTCHours();
+const isQuiet = (h, s, e) => s !== e && (s < e ? h >= s && h < e : h >= s || h < e);
 
 export function createMemoryDb() {
   const users = new Map();
+  const appState = new Map();
   let cards = [];
   let log = [];
   const clone = (x) => (x ? structuredClone(x) : null);
 
   return {
-    _state: { users, get cards() { return cards; }, get log() { return log; } },
+    _state: {
+      users,
+      appState,
+      get cards() {
+        return cards;
+      },
+      get log() {
+        return log;
+      },
+    },
 
-    async upsertUser(from, now) {
-      const prev = users.get(from.id) || { ...USER_DEFAULTS, id: from.id, created_at: now };
-      const u = { ...prev, username: from.username ?? null, first_name: from.first_name ?? null, language_code: from.language_code ?? null, last_active_at: now };
+    async touchUser(from, now, defaults = {}) {
+      const prev = users.get(from.id) || {
+        ...USER_DEFAULTS,
+        id: from.id,
+        lang: defaults.lang ?? 'en',
+        translate_to: defaults.translate_to ?? null,
+        created_at: now,
+      };
+      const u = {
+        ...prev,
+        username: from.username ?? null,
+        first_name: from.first_name ?? null,
+        language_code: from.language_code ?? null,
+        last_active_at: now,
+      };
       users.set(from.id, u);
       return clone(u);
     },
@@ -41,17 +67,30 @@ export function createMemoryDb() {
       if (u) users.set(id, { ...u, ...structuredClone(patch) });
     },
     async addCards(userId, items, now) {
-      let added = 0;
+      const added = [];
       items.forEach((it, i) => {
-        const word = String(it.word || '').trim();
-        const translation = String(it.translation || '').trim();
+        const word = String(it.word || '').trim().slice(0, 200);
+        const translation = String(it.translation || '').trim().slice(0, 300);
         if (!word || !translation) return;
         if (cards.some((c) => c.user_id === userId && c.word.toLowerCase() === word.toLowerCase())) return;
-        cards.push({
-          id: randomUUID(), user_id: userId, word, translation, example: String(it.example || '').trim(),
-          stage: 0, reps: 0, lapses: 0, due: now, last_reviewed: null, created_at: now + i + 1,
-        });
-        added++;
+        const card = {
+          id: randomUUID(),
+          user_id: userId,
+          word,
+          translation,
+          example: String(it.example || '').trim().slice(0, 500),
+          phonetic: String(it.phonetic || '').slice(0, 100),
+          audio_url: String(it.audio_url || '').slice(0, 500),
+          enriched: !!it.enriched,
+          stage: 0,
+          reps: 0,
+          lapses: 0,
+          due: now,
+          last_reviewed: null,
+          created_at: now + i + 1,
+        };
+        cards.push(card);
+        added.push(clone(card));
       });
       return added;
     },
@@ -71,6 +110,15 @@ export function createMemoryDb() {
       cards[i] = { ...cards[i], stage: card.stage, reps: card.reps, lapses: card.lapses, due: card.due, last_reviewed: card.last_reviewed };
       log.push({ user_id: card.user_id, card_id: card.id, grade, was_new: wasNew, reviewed_at: now });
       return true;
+    },
+    async updateCardText(userId, id, { word, translation, example }) {
+      const c = cards.find((x) => x.user_id === userId && x.id === id);
+      if (!c) return 'missing';
+      const w = word.trim().slice(0, 200);
+      if (cards.some((x) => x.user_id === userId && x.id !== id && x.word.toLowerCase() === w.toLowerCase())) return 'duplicate';
+      if (w.toLowerCase() !== c.word.toLowerCase()) Object.assign(c, { phonetic: '', audio_url: '', enriched: false });
+      Object.assign(c, { word: w, translation: translation.trim().slice(0, 300), example: (example ?? '').trim().slice(0, 500) });
+      return 'ok';
     },
     async countDue(userId, now) {
       return cards.filter((c) => c.user_id === userId && c.reps > 0 && c.due <= now).length;
@@ -124,7 +172,9 @@ export function createMemoryDb() {
       const lt = l.filter((x) => localDate(x.reviewed_at, off) === today);
       const forecast = Array.from({ length: 7 }, (_, n) => {
         const day = localDate(now + n * DAY, off);
-        return c.filter((x) => x.reps > 0 && (n === 0 ? x.due <= now || localDate(x.due, off) === day : x.due > now && localDate(x.due, off) === day)).length;
+        return c.filter(
+          (x) => x.reps > 0 && (n === 0 ? x.due <= now || localDate(x.due, off) === day : x.due > now && localDate(x.due, off) === day),
+        ).length;
       });
       return {
         total: c.length,
@@ -142,16 +192,41 @@ export function createMemoryDb() {
         forecast,
       };
     },
-    async dueUsers(now, gapMin, idleMin) {
+    async claimReminders(now, gapMin, idleMin, limit, test = false) {
       const out = [];
       for (const u of users.values()) {
-        if (!u.remind) continue;
-        if (u.last_notified_at != null && u.last_notified_at >= now - gapMin * MINUTE) continue;
+        if (out.length >= limit) break;
+        if (!u.remind || (test ? u.id >= 0 : u.id <= 0)) continue;
+        if (u.last_notified_at != null) {
+          // Same rule as public.reminder_gap_passed(): ignored reminders back off to 4× the gap.
+          const ignored = !(u.last_active_at > u.last_notified_at);
+          if (u.last_notified_at >= now - gapMin * MINUTE * (ignored ? 4 : 1)) continue;
+        }
         if (u.last_active_at != null && u.last_active_at >= now - idleMin * MINUTE) continue;
+        if (isQuiet(localHour(now, u.tz_offset_min), u.quiet_start, u.quiet_end)) continue;
         const n = cards.filter((c) => c.user_id === u.id && c.reps > 0 && c.due <= now).length;
-        if (n) out.push({ user_id: u.id, due_count: n, tz_offset_min: u.tz_offset_min, quiet_start: u.quiet_start, quiet_end: u.quiet_end });
+        if (!n) continue;
+        out.push({ user_id: u.id, due_count: n, lang: u.lang, prev_notified_at: u.last_notified_at });
+        u.last_notified_at = now;
       }
       return out;
+    },
+    async cardsToEnrich(limit) {
+      return cards
+        .filter((c) => !c.enriched)
+        .sort((a, b) => a.created_at - b.created_at)
+        .slice(0, limit)
+        .map((c) => ({ id: c.id, word: c.word }));
+    },
+    async saveEnrichment(id, { phonetic = '', audio_url = '' }) {
+      const c = cards.find((x) => x.id === id);
+      if (c) Object.assign(c, { phonetic, audio_url, enriched: true });
+    },
+    async getAppState(key) {
+      return clone(appState.get(key) ?? null);
+    },
+    async setAppState(key, value) {
+      appState.set(key, structuredClone(value));
     },
   };
 }

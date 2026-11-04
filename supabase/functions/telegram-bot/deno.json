@@ -1,0 +1,6 @@
+{
+  "imports": {
+    "grammy": "npm:grammy@1.45.1/web",
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2.118.0"
+  }
+}

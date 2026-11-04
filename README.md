@@ -63,4 +63,10 @@ tests/srs.test.js   scheduler tests (node --test)
 
 ## Telegram bot
 
-The `bot/` folder has a Telegram version that stores data in Supabase and sends reminders when words are due. See [bot/README.md](bot/README.md).
+The `bot/` folder has the Telegram version, which is **deployed and running on Supabase**:
+- an Edge Function with a webhook;
+- a scheduled job that sends reminders when words are due;
+- an interface in Uzbek, Russian and English;
+- automatic translation and pronunciation for new words.
+
+The only remaining step is adding the `BOT_TOKEN` secret. See [bot/README.md](bot/README.md).

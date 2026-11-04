@@ -1,152 +1,203 @@
 # WordLearning Telegram bot
 
-A Telegram bot for learning words with spaced repetition. It stores data in Supabase and **sends you a message when words are due for review**.
+A Telegram bot for learning words with spaced repetition. It works in Uzbek, Russian and English, translates new words automatically, adds pronunciation, and **sends you a message when words are due for review**.
 
-## What it does
+It runs entirely on Supabase:
+- an Edge Function receives Telegram messages through a webhook;
+- a scheduled database job calls it every minute to send reminders;
+- the data lives in Postgres.
 
-- **Add words** by sending them as text, one per line:
-  ```
-  apple - яблоко
-  to borrow - занимать, брать взаймы - Can I borrow your pen?
-  house	дом
-  ```
-  The format is `word - translation - optional example`. Tab, `=` and `;` also work as separators. You can paste up to 500 lines at once, for example two columns copied from Excel. Words you already have are skipped.
-- **📚 Review** has three modes:
-  - **Flashcards:** Show answer, then grade Again / Hard / Good / Easy. Each button shows when the word will come back.
-  - **Multiple choice:** pick one of 4 options.
-  - **Type the answer:** small typos are accepted, as is any of several translations.
-- **Intervals:** 10m → 1d → 3d → 7d → 14d → 1mo → 2mo → 4mo → 8mo.
+There is no server to rent or maintain.
+
+## ✅ Status
+
+| Part | State |
+|---|---|
+| Database (project **WordLearning Bot**, org Kuroloff, region Frankfurt) | ✅ created, all migrations applied |
+| Edge Function `telegram-bot` | ✅ deployed, tested end to end with simulated Telegram users |
+| Every-minute background job (`wordlearning-bot-tick`) | ✅ running |
+| **`BOT_TOKEN`** | ⏳ **the only thing left** (see below) |
+
+## 🔑 Connect the bot token (one time)
+
+1. In Telegram, open [@BotFather](https://t.me/BotFather), send `/newbot`, pick a name and a username, and copy the **token** (it looks like `123456789:AA…`).
+2. Open the [Supabase dashboard](https://supabase.com/dashboard) and go to project **WordLearning Bot** → **Edge Functions** → **Secrets**.
+3. Add a secret named `BOT_TOKEN` with your token as the value, and save.
+
+That's all. Within one minute the background job:
+- connects the webhook;
+- sets the command menu and the bot description in all three languages.
+
+Open your bot in Telegram and press **Start**.
+
+To change the bot later, put the new token in the same secret. The function notices the change and reconfigures itself.
+
+## What the bot does
+
+- **Three languages.** The interface is Uzbek, Russian or English, picked from the user's Telegram language. You can change it in ⚙️ Settings.
+- **Adding words**
+  - Send `word - translation - example`, one per line, up to 500 lines at a time, for example two columns copied from Excel.
+  - **Or send just the word.** The bot translates it with MyMemory into the user's language, for example `apple` → `olma`.
+  - If you send a word in your own language, such as `kitob`, the bot creates the English card instead: `book — kitob`.
+  - Words you already have are skipped.
+- **Pronunciation.** English words get their transcription (`/ˈæp.əl/`) and a 🔊 button that plays the pronunciation. Both come from the Free Dictionary API.
+- **Reviewing.** There are three modes:
+  - **flashcards:** show the answer, then grade Again / Hard / Good / Easy, with the next interval shown on each button;
+  - **multiple choice;**
+  - **typing:** small typos and missing accents are accepted.
+- **Intervals.** 10 min → 1 day → 3 days → 7 days → 14 days → 1 month → 2 months → 4 months → 8 months.
   - **Again** restarts the word.
   - **Hard** repeats the current interval.
   - **Good** moves one step up.
   - **Easy** skips a step.
-- **Directions:** word → translation, translation → word, or mixed.
-- **Daily limit for new words:** 20 by default.
-- **🔔 Reminders:** when words become due, the bot sends a message with a "▶️ Start review" button.
-  - At most one reminder every 3 hours.
-  - No reminders while you're studying.
-  - No reminders during quiet hours (23:00–08:00 by default), based on your time zone (UTC+5 by default).
-- **📊 Stats:** word counts by status, words due now, today's reviews, streak, accuracy, and upcoming reviews for the next 7 days.
-- **📋 My words:** a paged list. Use `/find word` to delete a word or reset its progress. `/export` sends a CSV file.
-- **⚙️ Settings:** study mode, direction, new words per day, reminders on/off, quiet hours, time zone (`/timezone +5:30` for an exact value), and deleting all words.
+- **🔔 Reminders.** When words become due, the bot sends a "Start review" message.
+  - At most one every 3 hours, and only every 12 hours after an ignored reminder.
+  - None while you're studying.
+  - None during quiet hours (23:00–08:00 by default) in your time zone (UTC+5 by default).
+- **Daily limit for new words:** 20 by default, changeable in Settings.
+- **📊 Stats.** Words by status, due now, today's reviews and accuracy, streak, and a 7-day forecast.
+- **📋 Managing words.**
+  - `/list` shows your words page by page.
+  - `/find word` lets you ✏️ edit, 🔄 reset or 🗑 delete a word.
+  - `/export` sends a CSV that opens correctly in Excel.
+- **⚙️ Settings:** mode, direction (word→translation, translation→word or mixed), new words per day, reminders, quiet hours, time zone, translation language, interface language, and "delete all my words".
 
 Commands: `/review /add /list /find /stats /settings /timezone /export /sample /help /cancel`
 
-## Setup
+## How it works
 
-### 1. Create the bot
-
-1. In Telegram, open [@BotFather](https://t.me/BotFather) and send `/newbot`.
-2. Copy the **token**.
-
-### 2. Create the database
-
-1. Create a project at [supabase.com](https://supabase.com). The free plan is enough.
-2. Open **SQL Editor**, paste the whole file [`supabase/migrations/20261102000000_wordlearning_bot.sql`](../supabase/migrations/20261102000000_wordlearning_bot.sql), and click **Run**.
-3. Go to **Project Settings → API** and copy the **Project URL** and the **service_role** key, also called the *secret* key.
-
-   The service_role key gives full access to the database. Keep it only on the server where the bot runs, and never share it or commit it. All tables have Row Level Security turned on with no policies, so the public anon key can't read anything.
-
-If you use the Supabase CLI, you can apply the migration with `supabase link` followed by `supabase db push` instead of step 2.
-
-### 3. Run locally
-
-Run these commands from the repository root:
-
-```bash
-cd bot
 ```
-```bash
-npm install
-```
-```bash
-cp .env.example .env
+Telegram ──webhook──▶ Edge Function telegram-bot ──▶ Postgres (users, cards, review_log)
+                        ▲          │
+pg_cron (every minute) ─┘          ├──▶ MyMemory (translation)
+  ?action=tick                     └──▶ dictionaryapi.dev (transcription, audio)
 ```
 
-Fill in `BOT_TOKEN`, `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in `.env`, then start the bot:
+Every minute the tick does three things:
+- It looks up pronunciations for words added in bulk.
+- Once `BOT_TOKEN` exists, it connects the webhook. After that it checks the connection once an hour and repairs it if needed.
+- It sends due reminders. The reminder query claims users atomically, so a user is never reminded twice.
 
+**Security**
+- Telegram requests are accepted only with a secret token derived from `BOT_TOKEN`.
+- Background calls need a random secret stored in `public.app_state`.
+- Row Level Security is on for every table, and the public API keys have no access at all. Only the function, with the project's secret key, reads and writes data.
+
+### Checking that everything works
+
+Run these in the Supabase **SQL Editor**:
+
+```sql
+-- Result of the last background run (webhook state, reminders sent, errors)
+select value from app_state where key = 'tick_status';
+
+-- Webhook bookkeeping (last Telegram delivery error, if any)
+select value from app_state where key = 'webhook';
+
+-- Scheduled job runs
+select status, start_time from cron.job_run_details order by start_time desc limit 5;
+```
+
+The Edge Function logs are in the dashboard under **Edge Functions → telegram-bot → Logs**.
+
+## Optional settings (Edge Function secrets)
+
+| Secret | Default | Meaning |
+|---|---|---|
+| `BOT_TOKEN` | — | **Required.** Token from @BotFather |
+| `MYMEMORY_EMAIL` | — | Your email for MyMemory. Raises the free translation quota from about 5,000 to about 50,000 characters a day |
+| `REMINDER_GAP_MINUTES` | 180 | Minimum time between two reminders to the same user |
+| `REMINDER_IDLE_MINUTES` | 20 | Don't remind someone who used the bot in the last N minutes |
+
+## Changing the code
+
+The bot logic lives in `bot/src`. The Edge Function in `supabase/functions/telegram-bot` uses a generated copy of it in `lib/`.
+
+1. Edit the files in `bot/src` (or `js/srs.js` for the scheduler).
+2. Run the tests:
+```bash
+cd bot && npm install && npm test
+```
+3. Regenerate the function's copy. A test fails if you forget this step.
+```bash
+npm run build:edge
+```
+4. Deploy with the [Supabase CLI](https://supabase.com/docs/guides/cli), from the repository root:
+```bash
+supabase link --project-ref givkncacizyipeipzzjl
+```
+```bash
+supabase functions deploy telegram-bot --no-verify-jwt
+```
+   Bump `VERSION` in `supabase/functions/telegram-bot/index.ts`. The health check shows it at `GET https://givkncacizyipeipzzjl.supabase.co/functions/v1/telegram-bot`.
+
+Database changes go into a new file in `supabase/migrations/`. Apply it with `supabase db push`.
+
+### Self-test without Telegram
+
+The function has a protected `?action=simulate` endpoint. It sends updates from **test users** (negative ids) through the real bot code and database, with a fake Telegram API, and returns every message the bot would have sent. From the SQL Editor:
+
+```sql
+select net.http_post(
+  url := 'https://givkncacizyipeipzzjl.supabase.co/functions/v1/telegram-bot?action=simulate',
+  body := '{"updates":[{"update_id":1,"message":{"message_id":1,"date":0,"chat":{"id":-1,"type":"private"},"from":{"id":-1,"is_bot":false,"first_name":"Test","language_code":"uz"},"text":"apple"}}]}'::jsonb,
+  headers := jsonb_build_object('Content-Type','application/json','x-cron-secret',(select value->>'secret' from app_state where key='cron')));
+-- a few seconds later:
+select content from net._http_response order by id desc limit 1;
+-- clean up the test user:
+delete from users where id < 0;
+```
+
+### Running locally (development only)
+
+```bash
+cd bot && cp .env.example .env
+```
+Fill in `.env`. Set `DB=memory` to try the bot without a database. Then start it:
 ```bash
 npm start
 ```
 
-Open your bot in Telegram and press **Start**. Node.js 20.12 or newer is required.
+This uses long polling, which removes the Supabase webhook. **Don't run it with the production token**, or use a second test bot from @BotFather. The deployed function re-connects its webhook within an hour.
 
-To try the bot quickly without Supabase, set `DB=memory` in `.env`. The data is lost on restart.
+## Setting it up in a different Supabase project
 
-## Deploy (keep it running 24/7)
-
-The bot uses long polling, so it doesn't need a public URL or a domain. It only needs a process that runs all the time, because the reminders come from that process.
-
-**VPS (Ubuntu) with pm2:**
-```bash
-npm i -g pm2
-```
-```bash
-cd wordlearning_app/bot && npm ci --omit=dev
-```
-```bash
-pm2 start src/index.js --name wordlearning-bot
-```
-```bash
-pm2 save && pm2 startup
-```
-
-**Docker:** the `Dockerfile` is in the repository root. Build from the root:
-```bash
-docker build -t wordlearning-bot .
-```
-```bash
-docker run -d --restart=always --env-file bot/.env --name wordlearning-bot wordlearning-bot
-```
-
-**Railway / Render / Fly.io:** deploy the repository with the root `Dockerfile` and set the environment variables from `.env.example`.
-- On Render, choose a **Background Worker**. Or choose a Web Service and set `PORT`, which turns on a small health-check endpoint.
-- Run only **one** copy of the bot. Telegram allows only one polling connection per token.
-
-## Settings (environment variables)
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `BOT_TOKEN` | — | Token from @BotFather |
-| `SUPABASE_URL` | — | Project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | — | service_role / secret key |
-| `REMINDER_CHECK_SECONDS` | 60 | How often to look for due words |
-| `REMINDER_GAP_MINUTES` | 180 | Minimum time between two reminders to the same user |
-| `REMINDER_IDLE_MINUTES` | 20 | Don't remind someone who used the bot in the last N minutes |
-| `PORT` | — | If set, serves `ok` on this port, for hosts that need a health check |
-| `DB` | — | `memory` runs without Supabase (testing only) |
-
-## Tests
-
-```bash
-npm test
-```
-
-The tests drive the whole bot with simulated Telegram updates and an in-memory database. They cover adding words, all three review modes, protection against double-pressed buttons, the daily limit, settings, list, find, delete, export, stats and the reminder rules.
+1. Run the files in `supabase/migrations/` in order. Use the SQL Editor or `supabase db push`.
+2. Deploy the function with `supabase functions deploy telegram-bot --no-verify-jwt`.
+3. Tell the scheduled job where the function is:
+   ```sql
+   insert into app_state (key, value)
+   values ('tick', jsonb_build_object('url', 'https://<project-ref>.supabase.co/functions/v1/telegram-bot?action=tick'))
+   on conflict (key) do update set value = excluded.value;
+   ```
+4. Add the `BOT_TOKEN` secret.
 
 ## Code layout
 
 ```
-bot/src/index.js         entry point: env, polling, reminder loop
-bot/src/bot.js           all commands, buttons and messages
-bot/src/reminders.js     finds users with due words and messages them
-bot/src/time.js          time zones, quiet hours, streak
-bot/src/db/supabase.js   Supabase data access
-bot/src/db/memory.js     same interface in memory (tests, DB=memory)
-js/srs.js                spaced-repetition scheduler, shared with the web app
-supabase/migrations/     database schema
+bot/src/bot.js            commands, buttons, review flow, settings
+bot/src/i18n.js           all texts in English, Russian and Uzbek
+bot/src/translate.js      MyMemory + Free Dictionary API clients
+bot/src/reminders.js      reminders and background pronunciation lookups
+bot/src/setup.js          webhook, command menu and bot description setup
+bot/src/time.js           time zones, quiet hours, streak
+bot/src/db/supabase.js    Supabase data access
+bot/src/db/memory.js      the same interface in memory (tests, DB=memory)
+bot/src/index.js          local long-polling runner
+bot/scripts/build-edge.mjs   copies the code above into the Edge Function
+js/srs.js                 spaced-repetition scheduler (shared with the web app)
+supabase/functions/telegram-bot/index.ts   Edge Function: webhook, tick, simulate
+supabase/migrations/      database schema, functions and the scheduled job
 ```
 
-## Database
+## Tests
 
-| Table | Contents |
-|---|---|
-| `users` | Telegram user, settings, reminder state |
-| `cards` | Words: `stage` (step on the interval ladder), `reps`, `due` |
-| `review_log` | Every answer, used for stats, streaks and the daily new-word limit |
+```bash
+cd bot && npm test
+```
 
-| Function | Purpose |
-|---|---|
-| `add_cards()` | Bulk insert that skips duplicates |
-| `user_stats()` | Everything the stats screen needs, in one call |
-| `due_users()` | Who should get a reminder now |
+There are 36 tests. They drive the whole bot with simulated Telegram updates, covering:
+- all three languages, auto-translation and pronunciation;
+- every review mode and editing;
+- settings and reminder rules (spacing, quiet hours, back-off, blocked users);
+- webhook setup, and a check that the Edge Function copy is up to date.
