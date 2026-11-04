@@ -11,10 +11,12 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "build:edge": "node scripts/build-edge.mjs",
+    "check:edge": "node scripts/build-edge.mjs --check"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.118.0",
-    "grammy": "^1.46.0"
+    "@supabase/supabase-js": "2.118.0",
+    "grammy": "1.45.1"
   }
 }

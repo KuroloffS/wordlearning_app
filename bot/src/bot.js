@@ -1,108 +1,116 @@
 import { Bot, InlineKeyboard, Keyboard, InputFile, GrammyError } from 'grammy';
 import {
   GRADES,
-  GRADE_NAMES,
   DEFAULT_INTERVALS,
   schedule,
   previewIntervals,
   isNew,
   cardStatus,
-  formatInterval,
   gradeTypedAnswer,
   parseBulk,
 } from '../../js/srs.js';
 import { startOfLocalDay, localTime, formatOffset, parseOffset, streakFromDays } from './time.js';
-import { SAMPLE_WORDS } from './samples.js';
+import {
+  t,
+  tRaw,
+  esc,
+  LANGS,
+  LANG_NAMES,
+  LANG_FLAGS,
+  MENU,
+  menuLabels,
+  isMenuLabel,
+  pickLang,
+  pickTranslateTo,
+  fmtInterval,
+  TRANSLATE_TARGETS,
+  weekday,
+} from './i18n.js';
+import { SAMPLES } from './samples.js';
+import { englishCandidate, mapLimit } from './translate.js';
 
 const INTERVALS = DEFAULT_INTERVALS;
 const MAX_STAGE = INTERVALS.length;
 const PAGE_SIZE = 20;
-const MAX_IMPORT = 500;
-
-export const MENU = {
-  review: '📚 Review',
-  add: '➕ Add words',
-  stats: '📊 Stats',
-  list: '📋 My words',
-  settings: '⚙️ Settings',
-};
-
-export const COMMANDS = [
-  ['review', 'Repeat words that are due'],
-  ['add', 'How to add words'],
-  ['list', 'Your words'],
-  ['find', 'Find a word: /find apple'],
-  ['stats', 'Your progress'],
-  ['settings', 'Mode, reminders, time zone'],
-  ['export', 'Download your words as CSV'],
-  ['sample', 'Add sample words'],
-  ['help', 'How it works'],
-];
-
-const MODE_NAMES = { flip: 'Flashcards', choice: 'Multiple choice', type: 'Type the answer' };
-const DIR_NAMES = { forward: 'Word → Translation', reverse: 'Translation → Word', mixed: 'Mixed' };
+export const MAX_IMPORT = 500;
+const MAX_AUTO_TRANSLATE = 20; // per message, to stay within the free translation quota
+const MAX_SYNC_ENRICH = 3; // look up pronunciation right away for small additions; bigger batches are done in the background
 const QUIET_PRESETS = [[23, 8], [22, 8], [0, 9], [21, 7], [0, 0]];
 const GRADE_ICONS = ['❌', '😐', '✅', '🚀'];
+const MODES = ['flip', 'choice', 'type'];
+const DIRS = ['forward', 'reverse', 'mixed'];
+const ID = '([0-9a-f-]{36})';
 
-export function esc(s) {
-  return String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+export function mainKeyboard(lang) {
+  const m = MENU[lang] ?? MENU.en;
+  return new Keyboard().text(m.review).text(m.add).row().text(m.stats).text(m.list).text(m.settings).resized().persistent();
 }
 
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-
-function shuffle(arr) {
+function shuffle(arr, random) {
   for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(random() * (i + 1));
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
 }
 
-export const mainKeyboard = new Keyboard()
-  .text(MENU.review)
-  .text(MENU.add)
-  .row()
-  .text(MENU.stats)
-  .text(MENU.list)
-  .text(MENU.settings)
-  .resized()
-  .persistent();
+const truncate = (s, n) => (String(s).length > n ? String(s).slice(0, n - 1) + '…' : String(s));
+const pad2 = (n) => String(n).padStart(2, '0');
+const lineOf = (c) => `${c.word} - ${c.translation}${c.example ? ` - ${c.example}` : ''}`;
 
-const HELP = `<b>How it works</b>
-
-1️⃣ Send me words, one per line:
-<code>apple - яблоко</code>
-<code>to borrow - занимать - Can I borrow your pen?</code>
-(word - translation - optional example; tab, "=", ";" also work)
-
-2️⃣ Press <b>${MENU.review}</b>. For every word, say how well you remembered it:
-❌ <b>Again</b> – forgot, it comes back in a minute
-😐 <b>Hard</b> – same interval again
-✅ <b>Good</b> – next step
-🚀 <b>Easy</b> – skip a step
-
-3️⃣ Each word comes back after growing intervals:
-${INTERVALS.map(formatInterval).join(' → ')}
-
-🔔 I'll message you when words are due for review.
-
-/list – your words · /find – search · /stats – progress · /settings · /export`;
+/** A line the user sent that could be a word or short phrase to translate automatically. */
+export function looksLikeWord(line) {
+  return line.length <= 60 && line.split(/\s+/).length <= 6 && /\p{L}/u.test(line) && !/https?:\/\//i.test(line);
+}
 
 /**
- * Builds the bot. `db` is db/supabase.js or db/memory.js; `clock` returns the current time in ms.
+ * Builds the bot. `db` is db/supabase.js or db/memory.js.
+ * Options: clock() → ms, botInfo (skips getMe), random() for tests,
+ * translator(text, to) and dictionary(word) from translate.js (optional), onError(err).
+ * @param {string} token
+ * @param {any} db
+ * @param {{
+ *   clock?: () => number,
+ *   botInfo?: any,
+ *   random?: () => number,
+ *   translator?: ((text: string, to: string, from?: string) => Promise<string | null>) | null,
+ *   dictionary?: ((word: string) => Promise<{ phonetic: string, audio_url: string } | null>) | null,
+ *   onError?: (err: any) => void,
+ * }} [options]
  */
-export function createBot(token, db, { clock = Date.now, botInfo, random = Math.random } = {}) {
+export function createBot(token, db, { clock = Date.now, botInfo, random = Math.random, translator = null, dictionary = null, onError } = {}) {
   const bot = new Bot(token, botInfo ? { botInfo } : undefined);
 
-  // ---------- load user on every update ----------
+  const T = (ctx, key, ...a) => t(ctx.lang, key, ...a);
+  const HTML = { parse_mode: 'HTML', link_preview_options: { is_disabled: true } };
+  const reply = (ctx, text, extra = {}) => ctx.reply(text, { ...HTML, ...extra });
+
+  /** Edits the message with the pressed button; if Telegram refuses (e.g. too old), sends a new one. */
+  async function safeEdit(ctx, text, extra = {}) {
+    try {
+      await ctx.editMessageText(text, { ...HTML, ...extra });
+    } catch (e) {
+      if (e instanceof GrammyError && /not modified/i.test(e.description)) return;
+      if (e instanceof GrammyError) return reply(ctx, text, extra);
+      throw e;
+    }
+  }
+
+  // ---------- load the user on every update ----------
   bot.use(async (ctx, next) => {
     if (!ctx.from || ctx.from.is_bot) return;
-    ctx.user = await db.upsertUser(ctx.from, clock());
-    // Leaving a typed-answer question by pressing a menu button or a command cancels it.
-    const text = ctx.message?.text;
-    if (ctx.user.pending && text && (text.startsWith('/') || Object.values(MENU).includes(text))) {
-      await setPending(ctx, null);
+    if (ctx.chat && ctx.chat.type !== 'private') {
+      if (ctx.message?.text?.startsWith('/start')) await ctx.reply(t(pickLang(ctx.from.language_code), 'private_only'));
+      return;
     }
+    ctx.user = await db.touchUser(ctx.from, clock(), {
+      lang: pickLang(ctx.from.language_code),
+      translate_to: pickTranslateTo(ctx.from.language_code),
+    });
+    ctx.lang = LANGS.includes(ctx.user.lang) ? ctx.user.lang : 'en';
+    // Leaving a question (typed answer / edit) by pressing a menu button or sending a command cancels it.
+    const text = ctx.message?.text;
+    if (ctx.user.pending && text && (text.startsWith('/') || isMenuLabel(text))) await setPending(ctx, null);
     await next();
   });
 
@@ -111,39 +119,59 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
     await db.updateUser(ctx.user.id, { pending });
   }
 
-  const reply = (ctx, text, extra = {}) => ctx.reply(text, { parse_mode: 'HTML', link_preview_options: { is_disabled: true }, ...extra });
+  // ---------- card rendering ----------
+  const wordLine = (c) => `<b>${esc(c.word)}</b>${c.phonetic ? ` <i>${esc(c.phonetic)}</i>` : ''}`;
+  const front = (c, rev) => (rev ? `<b>${esc(c.translation)}</b>` : wordLine(c));
+  function cardText(c, rev) {
+    let s = `${front(c, rev)}\n${rev ? wordLine(c) : esc(c.translation)}`;
+    if (c.example) s += `\n\n<i>${esc(c.example)}</i>`;
+    return s;
+  }
+  const audioKb = (c) => (c.audio_url ? new InlineKeyboard().text('🔊', `p:${c.id}`) : undefined);
 
-  // ---------- basic commands ----------
+  // ---------- start / help ----------
   bot.command('start', async (ctx) => {
-    const name = esc(ctx.from.first_name || 'there');
-    await reply(
-      ctx,
-      `👋 Hi, ${name}! I'll help you learn words with <b>spaced repetition</b>: every word comes back right before you would forget it.\n\n${HELP}`,
-      { reply_markup: mainKeyboard },
-    );
-    if ((await db.countNew(ctx.user.id)) + (await db.countDue(ctx.user.id, clock())) === 0) {
-      await reply(ctx, 'Send me your first words now, or try some examples 👇', {
-        reply_markup: new InlineKeyboard().text('✨ Add sample words', 'sample'),
-      });
+    await reply(ctx, `${T(ctx, 'greet', ctx.from.first_name || '🙂')}\n\n${T(ctx, 'help')}`, { reply_markup: mainKeyboard(ctx.lang) });
+    const { total } = await db.listCards(ctx.user.id, { limit: 1 });
+    if (total === 0) {
+      await reply(ctx, T(ctx, 'first_words'), { reply_markup: new InlineKeyboard().text(T(ctx, 'btn_samples'), 'sample') });
     }
   });
 
-  bot.command('help', (ctx) => reply(ctx, HELP, { reply_markup: mainKeyboard }));
+  bot.command('help', (ctx) => reply(ctx, T(ctx, 'help'), { reply_markup: mainKeyboard(ctx.lang) }));
+  bot.command('cancel', (ctx) => reply(ctx, T(ctx, 'cancelled'), { reply_markup: mainKeyboard(ctx.lang) }));
 
-  bot.command('cancel', (ctx) => reply(ctx, 'OK, cancelled.', { reply_markup: mainKeyboard }));
-
-  const addHelp = (ctx) =>
-    reply(
-      ctx,
-      `Send me words — one per line:\n\n<code>apple - яблоко\nweather - погода - The weather is nice today.\nhouse\tдом</code>\n\nFormat: <i>word - translation - example</i> (example is optional).\nSeveral translations: <code>to borrow - занимать, брать взаймы</code>\nYou can paste up to ${MAX_IMPORT} lines at once, e.g. two columns copied from Excel.`,
-    );
+  const addHelp = (ctx) => reply(ctx, T(ctx, 'add_help', MAX_IMPORT));
   bot.command('add', addHelp);
-  bot.hears(MENU.add, addHelp);
+  bot.hears(menuLabels('add'), addHelp);
+
+  // ---------- sample words ----------
+  async function addSamples(ctx, set) {
+    const added = await db.addCards(ctx.user.id, parseBulk(SAMPLES[set]), clock());
+    return reply(ctx, T(ctx, 'samples_added', added.length), {
+      reply_markup: new InlineKeyboard().text(T(ctx, 'btn_start_learning'), 'review'),
+    });
+  }
+  async function offerSamples(ctx) {
+    if (ctx.lang === 'ru' || ctx.lang === 'uz') return addSamples(ctx, ctx.lang);
+    return reply(ctx, T(ctx, 'choose_samples'), {
+      reply_markup: new InlineKeyboard().text('🇬🇧 → 🇺🇿 English – Oʻzbekcha', 'sample:uz').row().text('🇬🇧 → 🇷🇺 English – Русский', 'sample:ru'),
+    });
+  }
+  bot.command('sample', offerSamples);
+  bot.callbackQuery('sample', async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await offerSamples(ctx);
+  });
+  bot.callbackQuery(/^sample:(uz|ru)$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await addSamples(ctx, ctx.match[1]);
+  });
 
   // ---------- review ----------
   const startReview = (ctx) => sendNextCard(ctx);
   bot.command('review', startReview);
-  bot.hears(MENU.review, startReview);
+  bot.hears(menuLabels('review'), startReview);
   bot.callbackQuery('review', async (ctx) => {
     await ctx.answerCallbackQuery();
     await sendNextCard(ctx);
@@ -164,402 +192,576 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
 
     if (!card) {
       if (user.pending) await setPending(ctx, null);
-      return reply(ctx, await doneText(user, now, newLeft), { reply_markup: mainKeyboard });
+      return reply(ctx, await doneText(ctx, now, newLeft), { reply_markup: mainKeyboard(ctx.lang) });
     }
 
     const rev = pickReverse(user);
     const dueCount = await db.countDue(user.id, now);
     const left = dueCount + (isNew(card) ? Math.min(newLeft, await db.countNew(user.id)) : 0);
-    const head = `${isNew(card) ? '🆕 <b>New word</b>' : '🔁 <b>Review</b>'} · ${left} left`;
-    const prompt = `${head}\n\n<b>${esc(rev ? card.translation : card.word)}</b>`;
+    const prompt = `${T(ctx, isNew(card) ? 'head_new' : 'head_review')} · ${T(ctx, 'left', left)}\n\n${front(card, rev)}`;
+    const kb = new InlineKeyboard();
+    const sound = () => {
+      // In "translation → word" direction the sound would give the answer away.
+      if (card.audio_url && !rev) kb.text('🔊', `p:${card.id}`);
+    };
 
-    let mode = user.mode;
+    let mode = MODES.includes(user.mode) ? user.mode : 'flip';
     let options;
     if (mode === 'choice') {
       const field = rev ? 'word' : 'translation';
-      const correct = rev ? card.word : card.translation;
+      const correct = card[field];
       const others = [...new Set(await db.recentAnswers(user.id, card.id, field))].filter((a) => a !== correct);
       if (others.length < 2) mode = 'flip';
-      else options = shuffle([correct, ...shuffle(others).slice(0, 3)]);
+      else options = shuffle([correct, ...shuffle(others, random).slice(0, 3)], random);
     }
+    // A question left over from typing mode (or an unfinished edit) must not swallow the next message.
+    if (mode !== 'type' && user.pending) await setPending(ctx, null);
 
     if (mode === 'choice') {
       const correctIdx = options.indexOf(rev ? card.word : card.translation);
-      const kb = new InlineKeyboard();
       options.forEach((o, i) => kb.text(truncate(o, 60), `c:${card.id}:${card.reps}:${+rev}:${i}:${correctIdx}`).row());
-      kb.text('🤷 Don\'t know', `k:${card.id}:${card.reps}:${+rev}`);
-      return reply(ctx, `${prompt}\n\nChoose the ${rev ? 'word' : 'translation'}:`, { reply_markup: kb });
+      kb.text(T(ctx, 'btn_dont_know'), `k:${card.id}:${card.reps}:${+rev}`);
+      sound();
+      return reply(ctx, `${prompt}\n\n${T(ctx, rev ? 'choose_word' : 'choose_translation')}`, { reply_markup: kb });
     }
 
     if (mode === 'type') {
-      await setPending(ctx, { card_id: card.id, reps: card.reps, rev });
-      return reply(ctx, `${prompt}\n\n✍️ Type the ${rev ? 'word' : 'translation'}:`, {
-        reply_markup: new InlineKeyboard().text('🤷 Don\'t know', `k:${card.id}:${card.reps}:${+rev}`),
-      });
+      await setPending(ctx, { type: 'answer', card_id: card.id, reps: card.reps, rev });
+      kb.text(T(ctx, 'btn_dont_know'), `k:${card.id}:${card.reps}:${+rev}`);
+      sound();
+      return reply(ctx, `${prompt}\n\n${T(ctx, rev ? 'type_word' : 'type_translation')}`, { reply_markup: kb });
     }
 
-    return reply(ctx, prompt, {
-      reply_markup: new InlineKeyboard().text('👁 Show answer', `s:${card.id}:${card.reps}:${+rev}`),
-    });
+    kb.text(T(ctx, 'btn_show'), `s:${card.id}:${card.reps}:${+rev}`);
+    sound();
+    return reply(ctx, prompt, { reply_markup: kb });
   }
 
-  async function doneText(user, now, newLeft) {
+  async function doneText(ctx, now, newLeft) {
+    const user = ctx.user;
     const [nextDue, newCount] = await Promise.all([db.nextDueAt(user.id, now), db.countNew(user.id)]);
-    if (!nextDue && newCount === 0) {
-      return 'You have no words to study yet. Send me some words, e.g.\n<code>apple - яблоко</code>';
-    }
-    const lines = ['🎉 <b>All done for now!</b>'];
-    if (newCount > 0 && newLeft === 0) {
-      lines.push(`You've learned your ${user.new_per_day} new words for today. ${newCount} more are waiting for tomorrow (change the limit in ${MENU.settings}).`);
-    }
-    if (nextDue) lines.push(`⏰ Next review in <b>${formatInterval(nextDue - now)}</b> — I'll remind you.`);
+    if (!nextDue && newCount === 0) return T(ctx, 'no_words_yet');
+    const lines = [T(ctx, 'all_done')];
+    if (newCount > 0 && newLeft === 0) lines.push(T(ctx, 'limit_reached', user.new_per_day, newCount, MENU[ctx.lang].settings));
+    if (nextDue) lines.push(T(ctx, 'next_review_in', fmtInterval(ctx.lang, nextDue - now)));
     return lines.join('\n\n');
-  }
-
-  function truncate(s, n) {
-    s = String(s);
-    return s.length > n ? s.slice(0, n - 1) + '…' : s;
-  }
-
-  function cardText(card, rev) {
-    const q = rev ? card.translation : card.word;
-    const a = rev ? card.word : card.translation;
-    let t = `<b>${esc(q)}</b>\n${esc(a)}`;
-    if (card.example) t += `\n\n<i>${esc(card.example)}</i>`;
-    return t;
   }
 
   /** Loads the card from callback data and checks that the button is not stale. */
   async function cardFromCallback(ctx, id, reps) {
     const card = await db.getCard(ctx.user.id, id);
     if (!card) {
-      await ctx.answerCallbackQuery({ text: 'This word was deleted.' });
+      await ctx.answerCallbackQuery({ text: T(ctx, 'word_deleted') });
       return null;
     }
     if (card.reps !== Number(reps)) {
-      await ctx.answerCallbackQuery({ text: 'Already answered 👍' });
+      await ctx.answerCallbackQuery({ text: T(ctx, 'already_answered') });
       return null;
     }
     return card;
   }
 
+  /** Saves a review; returns the updated card plus the exact `interval` until the next review, or null if it was already answered. */
+  async function applyGrade(card, grade) {
+    const now = clock();
+    const updated = { ...schedule(card, grade, now, INTERVALS), last_reviewed: now };
+    const saved = await db.saveReview(updated, card.reps, grade, isNew(card), now);
+    return saved ? { ...updated, interval: updated.due - now } : null;
+  }
+
+  const resultLine = (ctx, g, interval) => `${GRADE_ICONS[g]} ${T(ctx, `grade_${g}`)} · ${T(ctx, 'next_in', fmtInterval(ctx.lang, interval))}`;
+
   // Show answer (flashcards)
-  bot.callbackQuery(/^s:([0-9a-f-]{36}):(\d+):([01])$/, async (ctx) => {
+  bot.callbackQuery(new RegExp(`^s:${ID}:(\\d+):([01])$`), async (ctx) => {
     const [, id, reps, rev] = ctx.match;
     const card = await cardFromCallback(ctx, id, reps);
     if (!card) return;
     await ctx.answerCallbackQuery();
     const previews = previewIntervals(card, INTERVALS);
     const kb = new InlineKeyboard();
-    [GRADES.AGAIN, GRADES.HARD, GRADES.GOOD, GRADES.EASY].forEach((g) =>
-      kb.text(`${GRADE_ICONS[g]} ${GRADE_NAMES[g]} · ${formatInterval(previews[g])}`, `g:${card.id}:${card.reps}:${rev}:${g}`).row(),
-    );
-    await ctx.editMessageText(`${isNew(card) ? '🆕' : '🔁'} ${cardText(card, rev === '1')}\n\nHow well did you remember?`, {
-      parse_mode: 'HTML',
-      reply_markup: kb,
+    [GRADES.AGAIN, GRADES.HARD, GRADES.GOOD, GRADES.EASY].forEach((g, i) => {
+      kb.text(`${GRADE_ICONS[g]} ${T(ctx, `grade_${g}`)} · ${fmtInterval(ctx.lang, previews[g])}`, `g:${card.id}:${card.reps}:${rev}:${g}`);
+      if (i % 2 === 1) kb.row();
     });
+    if (card.audio_url) kb.text('🔊', `p:${card.id}`);
+    await safeEdit(ctx, `${isNew(card) ? '🆕' : '🔁'} ${cardText(card, rev === '1')}\n\n${T(ctx, 'how_well')}`, { reply_markup: kb });
   });
 
   // Grade (flashcards)
-  bot.callbackQuery(/^g:([0-9a-f-]{36}):(\d+):([01]):([0-3])$/, async (ctx) => {
+  bot.callbackQuery(new RegExp(`^g:${ID}:(\\d+):([01]):([0-3])$`), async (ctx) => {
     const [, id, reps, rev, g] = ctx.match;
     const card = await cardFromCallback(ctx, id, reps);
     if (!card) return;
     await ctx.answerCallbackQuery();
-    const result = await applyGrade(ctx, card, Number(g));
+    const result = await applyGrade(card, Number(g));
     if (!result) return;
-    await ctx.editMessageText(`${cardText(card, rev === '1')}\n\n${GRADE_ICONS[g]} ${GRADE_NAMES[g]} · next in ${formatInterval(result.due - clock())}`, {
-      parse_mode: 'HTML',
-    });
+    await safeEdit(ctx, `${cardText(card, rev === '1')}\n\n${resultLine(ctx, Number(g), result.interval)}`, { reply_markup: audioKb(card) });
     await sendNextCard(ctx);
   });
 
   // Multiple choice answer
-  bot.callbackQuery(/^c:([0-9a-f-]{36}):(\d+):([01]):(\d):(\d)$/, async (ctx) => {
+  bot.callbackQuery(new RegExp(`^c:${ID}:(\\d+):([01]):(\\d):(\\d)$`), async (ctx) => {
     const [, id, reps, rev, chosen, correct] = ctx.match;
     const card = await cardFromCallback(ctx, id, reps);
     if (!card) return;
     const ok = chosen === correct;
-    await ctx.answerCallbackQuery({ text: ok ? '✅ Correct!' : '❌ Wrong' });
+    await ctx.answerCallbackQuery({ text: T(ctx, ok ? 'correct_toast' : 'wrong_toast') });
     const g = ok ? GRADES.GOOD : GRADES.AGAIN;
-    const result = await applyGrade(ctx, card, g);
+    const result = await applyGrade(card, g);
     if (!result) return;
-    const picked = ctx.callbackQuery.message?.reply_markup?.inline_keyboard?.[Number(chosen)]?.[0]?.text;
-    const verdict = ok ? '✅ Correct' : `❌ You chose: ${esc(picked ?? '?')}`;
-    await ctx.editMessageText(`${cardText(card, rev === '1')}\n\n${verdict} · next in ${formatInterval(result.due - clock())}`, {
-      parse_mode: 'HTML',
+    const picked = ctx.callbackQuery.message?.reply_markup?.inline_keyboard?.[Number(chosen)]?.[0]?.text ?? '?';
+    const verdict = ok ? T(ctx, 'verdict_correct') : T(ctx, 'verdict_chose', picked);
+    await safeEdit(ctx, `${cardText(card, rev === '1')}\n\n${verdict} · ${T(ctx, 'next_in', fmtInterval(ctx.lang, result.interval))}`, {
+      reply_markup: audioKb(card),
     });
     await sendNextCard(ctx);
   });
 
-  // "Don't know" (choice / type)
-  bot.callbackQuery(/^k:([0-9a-f-]{36}):(\d+):([01])$/, async (ctx) => {
+  // "Don't know" (choice / typing)
+  bot.callbackQuery(new RegExp(`^k:${ID}:(\\d+):([01])$`), async (ctx) => {
     const [, id, reps, rev] = ctx.match;
     const card = await cardFromCallback(ctx, id, reps);
     if (!card) return;
     await ctx.answerCallbackQuery();
     if (ctx.user.pending) await setPending(ctx, null);
-    const result = await applyGrade(ctx, card, GRADES.AGAIN);
+    const result = await applyGrade(card, GRADES.AGAIN);
     if (!result) return;
-    await ctx.editMessageText(`${cardText(card, rev === '1')}\n\n🔁 I'll ask again in a minute.`, { parse_mode: 'HTML' });
+    await safeEdit(ctx, `${cardText(card, rev === '1')}\n\n${T(ctx, 'ask_again')}`, { reply_markup: audioKb(card) });
     await sendNextCard(ctx);
   });
 
-  async function applyGrade(ctx, card, grade) {
-    const now = clock();
-    const wasNew = isNew(card);
-    const updated = schedule(card, grade, now, INTERVALS);
-    const saved = await db.saveReview(updated, card.reps, grade, wasNew, now);
-    return saved ? updated : null;
-  }
+  // Pronunciation
+  bot.callbackQuery(new RegExp(`^p:${ID}$`), async (ctx) => {
+    const card = await db.getCard(ctx.user.id, ctx.match[1]);
+    if (!card?.audio_url) return ctx.answerCallbackQuery({ text: T(ctx, 'no_audio') });
+    await ctx.answerCallbackQuery();
+    try {
+      await ctx.replyWithVoice(card.audio_url);
+    } catch {
+      try {
+        await ctx.replyWithAudio(card.audio_url, { title: card.word });
+      } catch (e) {
+        console.warn('Pronunciation failed:', e.description ?? e.message);
+        await reply(ctx, T(ctx, 'no_audio'));
+      }
+    }
+  });
 
-  // ---------- word list ----------
+  // ---------- word list / find / edit / delete ----------
   async function sendList(ctx, page, edit = false) {
     const { cards, total } = await db.listCards(ctx.user.id, { offset: page * PAGE_SIZE, limit: PAGE_SIZE });
-    if (total === 0) return reply(ctx, 'You have no words yet. Send me words like <code>apple - яблоко</code>');
+    if (total === 0) return reply(ctx, T(ctx, 'list_empty'));
     const pages = Math.ceil(total / PAGE_SIZE);
     const now = clock();
     const icon = { new: '🆕', learning: '📖', known: '✅', mastered: '🏆' };
     const lines = cards.map((c) => {
       const s = cardStatus(c, INTERVALS);
-      const when = isNew(c) ? '' : c.due <= now ? ' · <b>due</b>' : ` · ${formatInterval(c.due - now)}`;
-      return `${icon[s]} <b>${esc(c.word)}</b> — ${esc(c.translation)}<i>${when}</i>`;
+      const when = isNew(c) ? '' : c.due <= now ? ` · <b>${T(ctx, 'due_mark')}</b>` : ` · ${fmtInterval(ctx.lang, c.due - now)}`;
+      return `${icon[s]} <b>${esc(truncate(c.word, 40))}</b> — ${esc(truncate(c.translation, 60))}${when ? `<i>${when}</i>` : ''}`;
     });
-    const text = `📋 <b>Your words</b> (${total}) · page ${page + 1}/${pages}\n\n${lines.join('\n')}\n\n🆕 new · 📖 learning · ✅ known · 🏆 mastered\nTo delete or reset a word: /find word`;
+    const text = `${T(ctx, 'list_head', total, page + 1, pages)}\n\n${lines.join('\n')}\n\n${T(ctx, 'list_legend')}`;
     const kb = new InlineKeyboard();
-    if (page > 0) kb.text('⬅️ Prev', `l:${page - 1}`);
-    if (page < pages - 1) kb.text('Next ➡️', `l:${page + 1}`);
-    const extra = { parse_mode: 'HTML', reply_markup: kb };
-    return edit ? ctx.editMessageText(text, extra) : ctx.reply(text, extra);
+    if (page > 0) kb.text(T(ctx, 'btn_prev'), `l:${page - 1}`);
+    if (page < pages - 1) kb.text(T(ctx, 'btn_next'), `l:${page + 1}`);
+    return edit ? safeEdit(ctx, text, { reply_markup: kb }) : reply(ctx, text, { reply_markup: kb });
   }
   bot.command('list', (ctx) => sendList(ctx, 0));
-  bot.hears(MENU.list, (ctx) => sendList(ctx, 0));
+  bot.hears(menuLabels('list'), (ctx) => sendList(ctx, 0));
   bot.callbackQuery(/^l:(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     await sendList(ctx, Number(ctx.match[1]), true);
   });
 
+  function cardButtons(ctx, c) {
+    const kb = new InlineKeyboard().text(T(ctx, 'btn_edit'), `e:${c.id}`).text(T(ctx, 'btn_reset'), `z:${c.id}`).text(T(ctx, 'btn_delete'), `d:${c.id}`);
+    if (c.audio_url) kb.row().text('🔊', `p:${c.id}`);
+    return kb;
+  }
+
+  function cardState(ctx, c) {
+    const now = clock();
+    const when = isNew(c) ? T(ctx, 'when_new') : c.due <= now ? T(ctx, 'when_due') : T(ctx, 'when_next', fmtInterval(ctx.lang, c.due - now));
+    return T(ctx, 'card_state', T(ctx, `status_${cardStatus(c, INTERVALS)}`), c.stage, MAX_STAGE, when);
+  }
+
   bot.command('find', async (ctx) => {
     const q = ctx.match.trim();
-    if (!q) return reply(ctx, 'Usage: <code>/find apple</code>');
+    if (!q) return reply(ctx, T(ctx, 'find_usage'));
     const { cards, total } = await db.listCards(ctx.user.id, { search: q, limit: 5 });
-    if (!total) return reply(ctx, `Nothing found for “${esc(q)}”.`);
-    const now = clock();
+    if (!total) return reply(ctx, T(ctx, 'find_none', q));
     for (const c of cards) {
-      const s = cardStatus(c, INTERVALS);
-      const when = isNew(c) ? 'not studied yet' : c.due <= now ? 'due now' : `next review in ${formatInterval(c.due - now)}`;
-      await reply(ctx, `${cardText(c, false)}\n\n<i>${s}, step ${c.stage}/${MAX_STAGE}, ${when}</i>`, {
-        reply_markup: new InlineKeyboard().text('🗑 Delete', `d:${c.id}`).text('🔄 Reset progress', `z:${c.id}`),
-      });
+      await reply(ctx, `${cardText(c, false)}\n\n<i>${cardState(ctx, c)}</i>`, { reply_markup: cardButtons(ctx, c) });
     }
-    if (total > cards.length) await reply(ctx, `…and ${total - cards.length} more. Try a more specific search.`);
+    if (total > cards.length) await reply(ctx, T(ctx, 'find_more', total - cards.length));
   });
 
-  bot.callbackQuery(/^d:([0-9a-f-]{36})$/, async (ctx) => {
+  bot.callbackQuery(new RegExp(`^d:${ID}$`), async (ctx) => {
     const ok = await db.deleteCard(ctx.user.id, ctx.match[1]);
-    await ctx.answerCallbackQuery({ text: ok ? 'Deleted' : 'Already deleted' });
-    if (ok) await ctx.editMessageText('🗑 Deleted.');
+    await ctx.answerCallbackQuery({ text: T(ctx, ok ? 'deleted_toast' : 'already_deleted') });
+    if (ok) await safeEdit(ctx, T(ctx, 'deleted_msg'));
   });
 
-  bot.callbackQuery(/^z:([0-9a-f-]{36})$/, async (ctx) => {
+  bot.callbackQuery(new RegExp(`^z:${ID}$`), async (ctx) => {
     const ok = await db.resetCard(ctx.user.id, ctx.match[1], clock());
-    await ctx.answerCallbackQuery({ text: ok ? 'Progress reset — it is a new word again' : 'Word not found' });
-    if (ok) await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard().text('🗑 Delete', `d:${ctx.match[1]}`) });
+    await ctx.answerCallbackQuery({ text: T(ctx, ok ? 'reset_toast' : 'not_found_toast') });
+    if (!ok) return;
+    const card = await db.getCard(ctx.user.id, ctx.match[1]);
+    if (card) await safeEdit(ctx, `${cardText(card, false)}\n\n<i>${cardState(ctx, card)}</i>`, { reply_markup: cardButtons(ctx, card) });
   });
+
+  bot.callbackQuery(new RegExp(`^e:${ID}$`), async (ctx) => {
+    const card = await db.getCard(ctx.user.id, ctx.match[1]);
+    if (!card) return ctx.answerCallbackQuery({ text: T(ctx, 'not_found_toast') });
+    await ctx.answerCallbackQuery();
+    await setPending(ctx, { type: 'edit', card_id: card.id });
+    await reply(ctx, T(ctx, 'edit_prompt', lineOf(card)));
+  });
+
+  async function handleEdit(ctx, pending, text) {
+    const [item] = parseBulk(text.split(/\r?\n/)[0]);
+    if (!item) return reply(ctx, T(ctx, 'edit_bad'));
+    const res = await db.updateCardText(ctx.user.id, pending.card_id, item);
+    if (res === 'duplicate') return reply(ctx, T(ctx, 'edit_duplicate', item.word));
+    await setPending(ctx, null);
+    if (res === 'missing') return reply(ctx, T(ctx, 'word_deleted'));
+    let card = await db.getCard(ctx.user.id, pending.card_id);
+    if (card && !card.enriched) card = (await enrichCard(card)) ?? card;
+    return reply(ctx, `${T(ctx, 'edit_saved')}\n\n${cardText(card, false)}`, { reply_markup: cardButtons(ctx, card) });
+  }
+
+  // ---------- pronunciation lookups ----------
+  /** Adds phonetic/audio_url/enriched to word items (mutates). Lookup errors leave enriched=false so the background job retries. */
+  async function enrichItems(items) {
+    await mapLimit(items, 3, async (it) => {
+      if (!dictionary || !englishCandidate(it.word)) {
+        it.enriched = !!dictionary;
+        return;
+      }
+      try {
+        const r = await dictionary(it.word);
+        Object.assign(it, { phonetic: r?.phonetic ?? '', audio_url: r?.audio_url ?? '', enriched: true });
+      } catch (e) {
+        console.warn('Dictionary lookup failed:', e.message);
+      }
+    });
+  }
+
+  async function enrichCard(card) {
+    const it = { word: card.word };
+    await enrichItems([it]);
+    if (!it.enriched) return null;
+    await db.saveEnrichment(card.id, { phonetic: it.phonetic ?? '', audio_url: it.audio_url ?? '' });
+    return { ...card, phonetic: it.phonetic ?? '', audio_url: it.audio_url ?? '', enriched: true };
+  }
 
   // ---------- stats ----------
   async function sendStats(ctx) {
     const u = ctx.user;
     const now = clock();
     const s = await db.stats(u.id, now, u.tz_offset_min, MAX_STAGE);
-    if (!s.total) return reply(ctx, 'No words yet — send me some to get started!');
-    const streak = streakFromDays(s.days, now, u.tz_offset_min);
+    if (!s.total) return reply(ctx, T(ctx, 'stats_empty'));
     const pct = (a, b) => (b ? Math.round((a / b) * 100) + '%' : '—');
     const max = Math.max(1, ...s.forecast);
-    const dayName = (n) => (n === 0 ? 'Today' : new Date(now + u.tz_offset_min * 60000 + n * 86400000).toUTCString().slice(0, 3));
+    const label = (n) => (n === 0 ? T(ctx, 'today') : weekday(ctx.lang, new Date(now + u.tz_offset_min * 60000 + n * 86400000).getUTCDay()));
+    const width = Math.max(...s.forecast.map((_, n) => label(n).length));
     const bars = s.forecast
-      .map((v, n) => `<code>${dayName(n).padEnd(5)} ${'▇'.repeat(Math.round((v / max) * 12)).padEnd(12, ' ')} ${v}</code>`)
+      .map((v, n) => `<code>${esc(label(n).padEnd(width))} ${'▇'.repeat(Math.round((v / max) * 10)).padEnd(10, ' ')} ${v}</code>`)
       .join('\n');
-    const text = `📊 <b>Your progress</b>
-
-📚 Words: <b>${s.total}</b>
-🆕 New: ${s.new}
-📖 Learning: ${s.learning}
-✅ Known: ${s.known}
-🏆 Mastered: ${s.mastered}
-
-⏰ Due now: <b>${s.due}</b>
-📅 Today: ${plural(s.reviews_today, 'review')}, ${pct(s.correct_today, s.reviews_today)} correct, ${s.new_today} new
-🔥 Streak: ${plural(streak, 'day')}
-🎯 Accuracy (all time): ${pct(s.correct_total, s.reviews_total)}
-
-<b>Upcoming reviews</b>
-${bars}`;
-    const kb = s.due ? new InlineKeyboard().text('▶️ Review now', 'review') : undefined;
-    return reply(ctx, text, { reply_markup: kb });
+    const text = tRaw(ctx.lang, 'stats', {
+      total: s.total,
+      new: s.new,
+      learning: s.learning,
+      known: s.known,
+      mastered: s.mastered,
+      due: s.due,
+      reviews_today: s.reviews_today,
+      pct_today: pct(s.correct_today, s.reviews_today),
+      new_today: s.new_today,
+      streak: streakFromDays(s.days, now, u.tz_offset_min),
+      accuracy: pct(s.correct_total, s.reviews_total),
+      bars,
+    });
+    return reply(ctx, text, { reply_markup: s.due ? new InlineKeyboard().text(T(ctx, 'btn_review_now'), 'review') : undefined });
   }
   bot.command('stats', sendStats);
-  bot.hears(MENU.stats, sendStats);
+  bot.hears(menuLabels('stats'), sendStats);
 
   // ---------- settings ----------
-  function settingsView(u) {
-    const quiet = u.quiet_start === u.quiet_end ? 'off' : `${String(u.quiet_start).padStart(2, '0')}:00–${String(u.quiet_end).padStart(2, '0')}:00`;
-    const text = `⚙️ <b>Settings</b>
-
-🎴 Study mode: <b>${MODE_NAMES[u.mode]}</b>
-🔀 Direction: <b>${DIR_NAMES[u.direction]}</b>
-🆕 New words per day: <b>${u.new_per_day}</b>
-🔔 Reminders: <b>${u.remind ? 'on' : 'off'}</b>
-🌙 Quiet hours (no reminders): <b>${quiet}</b>
-🌍 Time zone: <b>${formatOffset(u.tz_offset_min)}</b> (your time now: ${localTime(clock(), u.tz_offset_min)})
-
-Exact time zone: <code>/timezone +5:30</code>`;
+  function settingsView(ctx) {
+    const u = ctx.user;
+    const L = ctx.lang;
+    const quiet = u.quiet_start === u.quiet_end ? t(L, 'off') : `${pad2(u.quiet_start)}:00–${pad2(u.quiet_end)}:00`;
+    const translate = u.translate_to ? (TRANSLATE_TARGETS[u.translate_to] ?? u.translate_to) : t(L, 'off');
+    const mode = t(L, `mode_${MODES.includes(u.mode) ? u.mode : 'flip'}`);
+    const dir = t(L, `dir_${DIRS.includes(u.direction) ? u.direction : 'forward'}`);
+    const text = tRaw(L, 'settings', {
+      mode,
+      dir,
+      perDay: u.new_per_day,
+      remind: t(L, u.remind ? 'on' : 'off'),
+      quiet,
+      tz: formatOffset(u.tz_offset_min),
+      time: localTime(clock(), u.tz_offset_min),
+      translate: esc(translate),
+      lang: LANG_NAMES[L],
+    });
     const kb = new InlineKeyboard()
-      .text(`🎴 ${MODE_NAMES[u.mode]}`, 'set:mode')
-      .text(`🔀 ${DIR_NAMES[u.direction]}`, 'set:dir')
+      .text(`🎴 ${mode}`, 'set:mode')
+      .text(`🔀 ${dir}`, 'set:dir')
       .row()
       .text('➖5', 'set:new:-5')
-      .text(`🆕 ${u.new_per_day}/day`, 'set:noop')
+      .text(`🆕 ${t(L, 'per_day', u.new_per_day)}`, 'set:noop')
       .text('➕5', 'set:new:5')
       .row()
-      .text(u.remind ? '🔔 Reminders: on' : '🔕 Reminders: off', 'set:remind')
-      .text(`🌙 Quiet: ${quiet}`, 'set:quiet')
+      .text(t(L, u.remind ? 'btn_reminders_on' : 'btn_reminders_off'), 'set:remind')
+      .text(t(L, 'btn_quiet', quiet), 'set:quiet')
       .row()
       .text('➖1h', 'set:tz:-60')
-      .text(formatOffset(u.tz_offset_min), 'set:noop')
+      .text(`🌍 ${formatOffset(u.tz_offset_min)}`, 'set:noop')
       .text('➕1h', 'set:tz:60')
       .row()
-      .text('🗑 Delete all my words', 'wipe');
+      .text(`🔤 ${translate}`, 'set:tr')
+      .text(`🌐 ${LANG_FLAGS[L]} ${LANG_NAMES[L]}`, 'set:lang')
+      .row()
+      .text(t(L, 'btn_wipe'), 'wipe');
     return { text, kb };
   }
 
   async function sendSettings(ctx) {
-    const { text, kb } = settingsView(ctx.user);
+    const { text, kb } = settingsView(ctx);
     return reply(ctx, text, { reply_markup: kb });
   }
+  async function showSettings(ctx) {
+    const { text, kb } = settingsView(ctx);
+    return safeEdit(ctx, text, { reply_markup: kb });
+  }
   bot.command('settings', sendSettings);
-  bot.hears(MENU.settings, sendSettings);
+  bot.hears(menuLabels('settings'), sendSettings);
 
   const cycle = (list, cur) => list[(list.indexOf(cur) + 1) % list.length];
 
-  bot.callbackQuery(/^set:(\w+)(?::(-?\d+))?$/, async (ctx) => {
+  bot.callbackQuery(/^set:(mode|dir|new|remind|tz|quiet|noop)(?::(-?\d+))?$/, async (ctx) => {
     const u = ctx.user;
     const [, key, arg] = ctx.match;
     const patch = {};
-    if (key === 'mode') patch.mode = cycle(Object.keys(MODE_NAMES), u.mode);
-    else if (key === 'dir') patch.direction = cycle(Object.keys(DIR_NAMES), u.direction);
+    if (key === 'mode') patch.mode = cycle(MODES, u.mode);
+    else if (key === 'dir') patch.direction = cycle(DIRS, u.direction);
     else if (key === 'new') patch.new_per_day = Math.max(0, Math.min(500, u.new_per_day + Number(arg)));
     else if (key === 'remind') patch.remind = !u.remind;
     else if (key === 'tz') patch.tz_offset_min = Math.max(-720, Math.min(840, u.tz_offset_min + Number(arg)));
     else if (key === 'quiet') {
       const i = QUIET_PRESETS.findIndex(([a, b]) => a === u.quiet_start && b === u.quiet_end);
-      const [a, b] = QUIET_PRESETS[(i + 1) % QUIET_PRESETS.length];
-      patch.quiet_start = a;
-      patch.quiet_end = b;
+      [patch.quiet_start, patch.quiet_end] = QUIET_PRESETS[(i + 1) % QUIET_PRESETS.length];
     }
     await ctx.answerCallbackQuery();
     if (!Object.keys(patch).length) return;
     await db.updateUser(u.id, patch);
     Object.assign(u, patch);
-    const { text, kb } = settingsView(u);
-    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+    await showSettings(ctx);
+  });
+
+  bot.callbackQuery('set:back', async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await showSettings(ctx);
+  });
+
+  bot.callbackQuery('set:lang', async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const kb = new InlineKeyboard();
+    for (const l of LANGS) kb.text(`${l === ctx.lang ? '✓ ' : ''}${LANG_FLAGS[l]} ${LANG_NAMES[l]}`, `lang:${l}`).row();
+    kb.text(T(ctx, 'btn_back'), 'set:back');
+    await safeEdit(ctx, T(ctx, 'choose_lang'), { reply_markup: kb });
+  });
+
+  bot.callbackQuery(/^lang:(en|ru|uz)$/, async (ctx) => {
+    const lang = ctx.match[1];
+    await db.updateUser(ctx.user.id, { lang });
+    ctx.user.lang = lang;
+    ctx.lang = lang;
+    await ctx.answerCallbackQuery();
+    await showSettings(ctx);
+    await reply(ctx, T(ctx, 'lang_set'), { reply_markup: mainKeyboard(lang) });
+  });
+
+  bot.callbackQuery('set:tr', async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const kb = new InlineKeyboard();
+    Object.entries(TRANSLATE_TARGETS).forEach(([code, name], i) => {
+      kb.text(`${ctx.user.translate_to === code ? '✓ ' : ''}${name}`, `tr:${code}`);
+      if (i % 2 === 1) kb.row();
+    });
+    kb.row().text(T(ctx, 'btn_translate_off'), 'tr:off').row().text(T(ctx, 'btn_back'), 'set:back');
+    await safeEdit(ctx, T(ctx, 'choose_translate'), { reply_markup: kb });
+  });
+
+  bot.callbackQuery(/^tr:([a-z]{2}|off)$/, async (ctx) => {
+    const code = ctx.match[1] === 'off' ? null : ctx.match[1];
+    if (code && !TRANSLATE_TARGETS[code]) return ctx.answerCallbackQuery();
+    await db.updateUser(ctx.user.id, { translate_to: code });
+    ctx.user.translate_to = code;
+    await ctx.answerCallbackQuery();
+    await showSettings(ctx);
   });
 
   bot.command('timezone', async (ctx) => {
     const off = parseOffset(ctx.match);
-    if (off === null) return reply(ctx, 'Usage: <code>/timezone +5</code>, <code>/timezone -4</code> or <code>/timezone +5:30</code>');
+    if (off === null) return reply(ctx, T(ctx, 'tz_usage'));
     await db.updateUser(ctx.user.id, { tz_offset_min: off });
-    await reply(ctx, `🌍 Time zone set to <b>${formatOffset(off)}</b>. Your time now: ${localTime(clock(), off)}`);
+    await reply(ctx, T(ctx, 'tz_set', formatOffset(off), localTime(clock(), off)));
   });
 
   bot.callbackQuery('wipe', async (ctx) => {
     await ctx.answerCallbackQuery();
-    await reply(ctx, '⚠️ Delete <b>all</b> your words and progress? This cannot be undone.', {
-      reply_markup: new InlineKeyboard().text('Yes, delete everything', 'wipe:yes').text('Cancel', 'wipe:no'),
+    await reply(ctx, T(ctx, 'wipe_confirm'), {
+      reply_markup: new InlineKeyboard().text(T(ctx, 'btn_wipe_yes'), 'wipe:yes').text(T(ctx, 'btn_cancel'), 'wipe:no'),
     });
   });
   bot.callbackQuery('wipe:yes', async (ctx) => {
     await db.deleteAllCards(ctx.user.id);
-    await ctx.answerCallbackQuery({ text: 'Deleted' });
-    await ctx.editMessageText('🗑 All words deleted.');
+    await ctx.answerCallbackQuery({ text: T(ctx, 'deleted_toast') });
+    await safeEdit(ctx, T(ctx, 'wiped'));
   });
   bot.callbackQuery('wipe:no', async (ctx) => {
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText('OK, nothing was deleted.');
+    await safeEdit(ctx, T(ctx, 'wipe_cancelled'));
   });
 
-  // ---------- export / samples ----------
+  // ---------- export ----------
   bot.command('export', async (ctx) => {
     const cards = await db.allCards(ctx.user.id);
-    if (!cards.length) return reply(ctx, 'You have no words to export yet.');
+    if (!cards.length) return reply(ctx, T(ctx, 'export_none'));
     const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const rows = [['word', 'translation', 'example', 'status', 'step', 'next_review'].join(',')];
+    const rows = [['word', 'translation', 'example', 'transcription', 'status', 'step', 'next_review'].join(',')];
     for (const c of cards) {
-      rows.push([c.word, c.translation, c.example, cardStatus(c, INTERVALS), c.stage, isNew(c) ? '' : new Date(c.due).toISOString()].map(q).join(','));
-    }
-    // BOM so Excel opens UTF-8 (Cyrillic etc.) correctly.
-    const file = new InputFile(Buffer.from('﻿' + rows.join('\n'), 'utf8'), 'my-words.csv');
-    await ctx.replyWithDocument(file, { caption: `📦 ${plural(cards.length, 'word')}` });
-  });
-
-  async function addSamples(ctx) {
-    const added = await db.addCards(ctx.user.id, parseBulk(SAMPLE_WORDS), clock());
-    await reply(ctx, `✨ Added ${plural(added, 'sample word')}. Let's start!`, {
-      reply_markup: new InlineKeyboard().text('▶️ Start learning', 'review'),
-    });
-  }
-  bot.command('sample', addSamples);
-  bot.callbackQuery('sample', async (ctx) => {
-    await ctx.answerCallbackQuery();
-    await addSamples(ctx);
-  });
-
-  // ---------- free text: typed answers or new words ----------
-  bot.on('message:text', async (ctx) => {
-    const text = ctx.message.text;
-    if (text.startsWith('/')) return reply(ctx, 'Unknown command. See /help');
-
-    const pending = ctx.user.pending;
-    if (pending?.card_id) {
-      await setPending(ctx, null);
-      const card = await db.getCard(ctx.user.id, pending.card_id);
-      if (card && card.reps === pending.reps) {
-        const expected = pending.rev ? card.word : card.translation;
-        const g = gradeTypedAnswer(text, expected);
-        const result = await applyGrade(ctx, card, g);
-        if (result) {
-          const verdict =
-            g === GRADES.GOOD ? '✅ Correct!' : g === GRADES.HARD ? `😐 Almost! Correct spelling: <b>${esc(expected)}</b>` : `❌ Correct answer: <b>${esc(expected)}</b>`;
-          await reply(ctx, `${verdict}\n\n${cardText(card, pending.rev)}\n\n<i>Next review in ${formatInterval(result.due - clock())}</i>`);
-        }
-        return sendNextCard(ctx);
-      }
-    }
-
-    const items = parseBulk(text);
-    if (!items.length) {
-      return reply(
-        ctx,
-        `I didn't find any words. Use the format <code>word - translation</code>, one per line.\n\nExample:\n<code>apple - яблоко</code>`,
+      rows.push(
+        [c.word, c.translation, c.example, c.phonetic, cardStatus(c, INTERVALS), c.stage, isNew(c) ? '' : new Date(c.due).toISOString()]
+          .map(q)
+          .join(','),
       );
     }
-    if (items.length > MAX_IMPORT) return reply(ctx, `That's ${items.length} lines — please send at most ${MAX_IMPORT} at a time.`);
-    const added = await db.addCards(ctx.user.id, items, clock());
-    const skipped = items.length - added;
-    let msg = added
-      ? `✅ Added ${plural(added, 'word')}${added === 1 ? `: <b>${esc(items[0].word)}</b> — ${esc(items[0].translation)}` : ''}.`
-      : '🤔 Nothing new added.';
-    if (skipped) msg += `\n${plural(skipped, 'word')} you already have ${skipped === 1 ? 'was' : 'were'} skipped.`;
-    await reply(ctx, msg, { reply_markup: added ? new InlineKeyboard().text('▶️ Start learning', 'review') : undefined });
+    // The BOM makes Excel open UTF-8 (Cyrillic, Uzbek letters) correctly.
+    const bytes = new TextEncoder().encode('﻿' + rows.join('\n'));
+    await ctx.replyWithDocument(new InputFile(bytes, 'my-words.csv'), { caption: T(ctx, 'export_caption', cards.length) });
   });
 
-  // Any other callback (old buttons after a bot update, etc.)
-  bot.on('callback_query:data', (ctx) => ctx.answerCallbackQuery({ text: 'This button is no longer active.' }));
+  // ---------- free text: typed answers, edits, new words ----------
+  async function handleTypedAnswer(ctx, pending, text) {
+    await setPending(ctx, null);
+    const card = await db.getCard(ctx.user.id, pending.card_id);
+    if (card && card.reps === pending.reps) {
+      const expected = pending.rev ? card.word : card.translation;
+      const g = gradeTypedAnswer(text, expected);
+      const result = await applyGrade(card, g);
+      if (result) {
+        const verdict = g === GRADES.GOOD ? T(ctx, 'typed_correct') : g === GRADES.HARD ? T(ctx, 'typed_almost', expected) : T(ctx, 'typed_wrong', expected);
+        const next = T(ctx, 'next_review_short', fmtInterval(ctx.lang, result.interval));
+        await reply(ctx, `${verdict}\n\n${cardText(card, pending.rev)}\n\n<i>${next}</i>`, { reply_markup: audioKb(card) });
+      }
+    }
+    return sendNextCard(ctx);
+  }
+
+  /** Translates a bare word. If it is already in the target language, learns its English equivalent instead. */
+  async function autoTranslate(word, target) {
+    const tr = await translator(word, target);
+    if (tr) return { word, translation: tr, example: '' };
+    if (target !== 'en') {
+      const en = await translator(word, 'en');
+      if (en && en.toLowerCase() !== word.toLowerCase()) return { word: en, translation: word, example: '' };
+    }
+    return null;
+  }
+
+  async function addWordsFromText(ctx, text) {
+    const lines = text
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s && !s.startsWith('#'));
+    if (lines.length > MAX_IMPORT) return reply(ctx, T(ctx, 'too_many', lines.length, MAX_IMPORT));
+
+    const items = [];
+    const bare = [];
+    for (const line of lines) {
+      const [item] = parseBulk(line);
+      if (item) items.push(item);
+      else if (looksLikeWord(line)) bare.push(line);
+    }
+    if (!items.length && !bare.length) return reply(ctx, T(ctx, 'nothing_parsed'));
+
+    const target = ctx.user.translate_to;
+    const auto = [];
+    const failed = [];
+    let hint = false;
+    if (bare.length) {
+      if (!target || !translator) hint = true;
+      else {
+        const todo = bare.slice(0, MAX_AUTO_TRANSLATE);
+        failed.push(...bare.slice(MAX_AUTO_TRANSLATE));
+        const results = await mapLimit(todo, 4, (w) =>
+          autoTranslate(w, target).catch((e) => {
+            console.warn('Translation failed:', e.message);
+            return null;
+          }),
+        );
+        results.forEach((r, i) => (r ? auto.push(r) : failed.push(todo[i])));
+      }
+    }
+    const failedText = failed.length > 10 ? `${failed.slice(0, 10).join(', ')}, …` : failed.join(', ');
+    if (!items.length && !auto.length) {
+      return reply(ctx, hint ? T(ctx, 'translate_off_hint') : T(ctx, 'not_translated', failedText));
+    }
+
+    const all = [...items, ...auto];
+    if (all.length <= MAX_SYNC_ENRICH) await enrichItems(all);
+    const added = await db.addCards(ctx.user.id, all, clock());
+    const autoWords = new Set(auto.map((a) => a.word.toLowerCase()));
+    const isAuto = (c) => autoWords.has(c.word.toLowerCase());
+
+    let msg;
+    let kb;
+    if (added.length === 1) {
+      const c = added[0];
+      msg = tRaw(ctx.lang, 'added_one', wordLine(c), esc(c.translation));
+      if (isAuto(c)) msg += `\n${T(ctx, 'auto_note')}`;
+      kb = new InlineKeyboard().text(T(ctx, 'btn_edit'), `e:${c.id}`).text(T(ctx, 'btn_delete'), `d:${c.id}`);
+      if (c.audio_url) kb.text('🔊', `p:${c.id}`);
+      kb.row().text(T(ctx, 'btn_start_learning'), 'review');
+    } else if (added.length > 1) {
+      const shown = added.slice(0, 15).map((c) => `• ${wordLine({ ...c, word: truncate(c.word, 40) })} — ${esc(truncate(c.translation, 60))}`);
+      if (added.length > 15) shown.push('…');
+      msg = `${T(ctx, 'added_n', added.length)}\n\n${shown.join('\n')}`;
+      if (added.some(isAuto)) msg += `\n\n${T(ctx, 'auto_note_many')}`;
+      kb = new InlineKeyboard().text(T(ctx, 'btn_start_learning'), 'review');
+    } else {
+      msg = T(ctx, 'nothing_new');
+    }
+    const skipped = all.length - added.length;
+    if (skipped > 0) msg += `\n${T(ctx, 'skipped_dups', skipped)}`;
+    if (failed.length) msg += `\n\n${T(ctx, 'not_translated', failedText)}`;
+    if (hint) msg += `\n\n${T(ctx, 'translate_off_hint')}`;
+    return reply(ctx, msg, { reply_markup: kb });
+  }
+
+  bot.on('message:text', async (ctx) => {
+    const text = ctx.message.text;
+    if (text.startsWith('/')) return reply(ctx, T(ctx, 'unknown_cmd'));
+    const pending = ctx.user.pending;
+    if (pending?.type === 'answer') return handleTypedAnswer(ctx, pending, text);
+    if (pending?.type === 'edit') return handleEdit(ctx, pending, text);
+    return addWordsFromText(ctx, text);
+  });
+
+  // Photos, stickers, voice messages…: explain what the bot understands.
+  bot.on('message', (ctx) => reply(ctx, T(ctx, 'nothing_parsed')));
+
+  // Any other button (e.g. from an old message after an update).
+  bot.on('callback_query:data', (ctx) => ctx.answerCallbackQuery({ text: T(ctx, 'inactive_btn') }));
 
   bot.catch((err) => {
     const e = err.error;
     if (e instanceof GrammyError && /message is not modified/.test(e.description)) return;
-    console.error(`Error while handling update ${err.ctx?.update?.update_id}:`, e);
+    if (onError) onError(err);
+    else console.error(`Error while handling update ${err.ctx?.update?.update_id}:`, e);
   });
 
   return bot;

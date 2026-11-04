@@ -1,8 +1,13 @@
+// Local runner (long polling). The production deployment is the Supabase Edge Function in
+// supabase/functions/telegram-bot — do NOT run this with the same BOT_TOKEN at the same time:
+// starting long polling removes the webhook (the Edge Function sets it back within an hour).
 import http from 'node:http';
-import { createBot, COMMANDS } from './bot.js';
+import { createBot } from './bot.js';
 import { createSupabaseDb } from './db/supabase.js';
 import { createMemoryDb } from './db/memory.js';
-import { startReminderLoop } from './reminders.js';
+import { startBackgroundLoop } from './reminders.js';
+import { setupProfile } from './setup.js';
+import { createTranslator, createDictionary } from './translate.js';
 
 try {
   process.loadEnvFile(); // reads .env if present (Node >= 20.12)
@@ -26,23 +31,24 @@ if (env.DB === 'memory') {
   db = createSupabaseDb(required('SUPABASE_URL'), required('SUPABASE_SERVICE_ROLE_KEY'));
 }
 
-const bot = createBot(token, db);
-await bot.api.setMyCommands(COMMANDS.map(([command, description]) => ({ command, description })));
+const translator = createTranslator({ email: env.MYMEMORY_EMAIL });
+const dictionary = createDictionary();
+const bot = createBot(token, db, { translator, dictionary });
+await setupProfile(bot.api);
 
-const stopReminders = startReminderLoop(bot.api, db, {
+const stopBackground = startBackgroundLoop(bot.api, db, {
   everySec: Number(env.REMINDER_CHECK_SECONDS || 60),
   gapMin: Number(env.REMINDER_GAP_MINUTES || 180),
   idleMin: Number(env.REMINDER_IDLE_MINUTES || 20),
+  dictionary,
 });
 
-// Optional health-check endpoint for hosts that expect a web port (Render, Railway, Fly.io…).
+// Optional health-check endpoint for hosts that expect a web port.
 let server;
-if (env.PORT) {
-  server = http.createServer((_req, res) => res.end('ok')).listen(Number(env.PORT));
-}
+if (env.PORT) server = http.createServer((_req, res) => res.end('ok')).listen(Number(env.PORT));
 
 const shutdown = async () => {
-  stopReminders();
+  stopBackground();
   server?.close();
   await bot.stop();
   process.exit(0);
@@ -52,5 +58,5 @@ process.once('SIGTERM', shutdown);
 
 await bot.start({
   allowed_updates: ['message', 'callback_query'],
-  onStart: (me) => console.log(`✅ Bot @${me.username} is running`),
+  onStart: (me) => console.log(`✅ Bot @${me.username} is running (long polling)`),
 });
