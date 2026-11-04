@@ -11,8 +11,9 @@ const USER_DEFAULTS = {
   tz_offset_min: 300,
   quiet_start: 23,
   quiet_end: 8,
-  lang: 'en',
-  translate_to: null,
+  lang: 'ru',
+  learn: 'de',
+  auto_translate: true,
   pending: null,
   last_active_at: null,
   last_notified_at: null,
@@ -45,8 +46,9 @@ export function createMemoryDb() {
       const prev = users.get(from.id) || {
         ...USER_DEFAULTS,
         id: from.id,
-        lang: defaults.lang ?? 'en',
-        translate_to: defaults.translate_to ?? null,
+        lang: defaults.lang ?? 'ru',
+        learn: defaults.learn ?? 'de',
+        tz_offset_min: defaults.tz_offset_min ?? 300,
         created_at: now,
       };
       const u = {
@@ -81,6 +83,7 @@ export function createMemoryDb() {
           example: String(it.example || '').trim().slice(0, 500),
           phonetic: String(it.phonetic || '').slice(0, 100),
           audio_url: String(it.audio_url || '').slice(0, 500),
+          audio_file_id: '',
           enriched: !!it.enriched,
           stage: 0,
           reps: 0,
@@ -116,7 +119,7 @@ export function createMemoryDb() {
       if (!c) return 'missing';
       const w = word.trim().slice(0, 200);
       if (cards.some((x) => x.user_id === userId && x.id !== id && x.word.toLowerCase() === w.toLowerCase())) return 'duplicate';
-      if (w.toLowerCase() !== c.word.toLowerCase()) Object.assign(c, { phonetic: '', audio_url: '', enriched: false });
+      if (w.toLowerCase() !== c.word.toLowerCase()) Object.assign(c, { phonetic: '', audio_url: '', audio_file_id: '', enriched: false });
       Object.assign(c, { word: w, translation: translation.trim().slice(0, 300), example: (example ?? '').trim().slice(0, 500) });
       return 'ok';
     },
@@ -218,9 +221,16 @@ export function createMemoryDb() {
         .slice(0, limit)
         .map((c) => ({ id: c.id, word: c.word }));
     },
-    async saveEnrichment(id, { phonetic = '', audio_url = '' }) {
+    async saveEnrichment(id, { phonetic = '', audio_url = '', word }) {
       const c = cards.find((x) => x.id === id);
-      if (c) Object.assign(c, { phonetic, audio_url, enriched: true });
+      if (!c) return;
+      Object.assign(c, { phonetic, audio_url, audio_file_id: '', enriched: true });
+      const taken = word && cards.some((x) => x.user_id === c.user_id && x.id !== id && x.word.toLowerCase() === word.toLowerCase());
+      if (word && !taken) c.word = word;
+    },
+    async saveAudioFileId(id, fileId) {
+      const c = cards.find((x) => x.id === id);
+      if (c) c.audio_file_id = fileId;
     },
     async getAppState(key) {
       return clone(appState.get(key) ?? null);

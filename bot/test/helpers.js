@@ -1,6 +1,7 @@
-// Test harness: the real bot with an in-memory database and a fake Telegram API.
+// Test harness: the real bot with an in-memory database, a fake Telegram API and a fake dictionary.
 import { createBot } from '../src/bot.js';
 import { createMemoryDb } from '../src/db/memory.js';
+import { stripArticle } from '../src/translate.js';
 
 export const BOT_INFO = {
   id: 1,
@@ -13,50 +14,76 @@ export const BOT_INFO = {
 };
 
 export const USERS = {
-  en: { id: 111, is_bot: false, first_name: 'Ali', username: 'ali', language_code: 'en' },
-  uz: { id: 222, is_bot: false, first_name: 'Sardor', language_code: 'uz' },
-  ru: { id: 333, is_bot: false, first_name: 'Ольга', language_code: 'ru' },
+  ru: { id: 111, is_bot: false, first_name: 'Ольга', username: 'olga', language_code: 'ru' },
+  de: { id: 222, is_bot: false, first_name: 'Hans', language_code: 'de' },
+  uz: { id: 333, is_bot: false, first_name: 'Sardor', language_code: 'uz' }, // gets the Russian interface
 };
 
-export const AUDIO = 'https://api.dictionaryapi.dev/media/pronunciations/en/apple-us.mp3';
-
-const TRANSLATIONS = {
-  'apple|uz': 'olma',
-  'weather|uz': 'ob-havo',
-  'reliable|uz': 'ishonchli',
-  'kitob|en': 'book',
-  'apple|ru': 'яблоко',
+export const AUDIO = {
+  haus: 'https://upload.wikimedia.org/wikipedia/commons/transcoded/7/7e/De-Haus.ogg/De-Haus.ogg.mp3',
+  katze: 'https://upload.wikimedia.org/wikipedia/commons/transcoded/a/a1/De-Katze.ogg/De-Katze.ogg.mp3',
+  dom: 'https://upload.wikimedia.org/wikipedia/commons/transcoded/1/12/Ru-дом.ogg/Ru-дом.ogg.mp3',
+  koshka: 'https://upload.wikimedia.org/wikipedia/commons/transcoded/b/b2/Ru-кошка.ogg/Ru-кошка.ogg.mp3',
 };
+
+const entry = (lang, lemma, article, ipa, audio_url, translations) => ({
+  lang,
+  lemma,
+  article,
+  headword: article ? `${article} ${lemma}` : lemma,
+  ipa,
+  audio_url,
+  translations,
+  pos: article ? 'Substantiv' : '',
+});
+
+const DICT = {
+  de: {
+    haus: entry('de', 'Haus', 'das', '[haʊ̯s]', AUDIO.haus, ['дом']),
+    katze: entry('de', 'Katze', 'die', '[ˈkat͡sə]', AUDIO.katze, ['кошка']),
+    lernen: entry('de', 'lernen', '', '[ˈlɛʁnən]', '', ['учить']),
+  },
+  ru: {
+    'дом': entry('ru', 'дом', '', '[dom]', AUDIO.dom, ['Haus', 'Gebäude']),
+    'кошка': entry('ru', 'кошка', '', '[ˈkoʂkə]', AUDIO.koshka, ['Katze']),
+  },
+};
+
+export function fakeDictionary(calls = []) {
+  return async (text, lang) => {
+    calls.push(`${text}|${lang}`);
+    if (/flaky/i.test(text)) throw new Error('HTTP 503');
+    const key = (lang === 'de' ? stripArticle(text) : String(text)).toLowerCase();
+    return DICT[lang]?.[key] ?? null;
+  };
+}
+
+const TRANSLATIONS = { 'fahrrad|ru': 'велосипед', 'велосипед|de': 'Fahrrad' };
 
 export function fakeTranslator(calls = []) {
-  return async (text, to) => {
-    calls.push(`${text}|${to}`);
+  return async (text, to, from) => {
+    calls.push(`${text}|${from}>${to}`);
     if (text === 'boom') throw new Error('network down');
     return TRANSLATIONS[`${text.toLowerCase()}|${to}`] ?? null;
   };
 }
 
-export function fakeDictionary(calls = []) {
-  return async (word) => {
-    calls.push(word);
-    if (word === 'flaky') throw new Error('HTTP 503');
-    if (word === 'apple') return { phonetic: '/ˈæp.əl/', audio_url: AUDIO };
-    if (word === 'weather') return { phonetic: '/ˈwɛðə/', audio_url: '' };
-    return null;
-  };
-}
-
-export function harness({ start = Date.UTC(2026, 0, 5, 9, 0), user = USERS.en, failMethods = [], translator, dictionary } = {}) {
+export function harness({ start = Date.UTC(2026, 0, 5, 9, 0), user = USERS.ru, failMethods = [], translator, dictionary } = {}) {
   const clock = { now: start };
   const db = createMemoryDb();
   const translatorCalls = [];
   const dictionaryCalls = [];
+  const audioDownloads = [];
   const bot = createBot('TEST:TOKEN', db, {
     clock: () => clock.now,
     botInfo: BOT_INFO,
     random: () => 0.9,
     translator: translator === undefined ? fakeTranslator(translatorCalls) : translator,
     dictionary: dictionary === undefined ? fakeDictionary(dictionaryCalls) : dictionary,
+    fetchAudio: async (url) => {
+      audioDownloads.push(url);
+      return new Uint8Array([73, 68, 51]); // "ID3"
+    },
     onError: (err) => {
       throw err.error;
     },
@@ -66,9 +93,11 @@ export function harness({ start = Date.UTC(2026, 0, 5, 9, 0), user = USERS.en, f
   bot.api.config.use(async (_prev, method, payload) => {
     calls.push({ method, payload });
     if (failMethods.includes(method)) return { ok: false, error_code: 400, description: `Bad Request: ${method} failed` };
-    const result = method.startsWith('send')
-      ? { message_id: ++msgId, date: 0, chat: { id: payload.chat_id, type: 'private' }, text: payload.text }
-      : true;
+    let result = true;
+    if (method.startsWith('send')) {
+      result = { message_id: ++msgId, date: 0, chat: { id: payload.chat_id, type: 'private' }, text: payload.text };
+      if (method === 'sendVoice') result.voice = { file_id: `VOICE-${msgId}`, file_unique_id: `u${msgId}`, duration: 1 };
+    }
     return { ok: true, result };
   });
   let updateId = 0;
@@ -93,5 +122,6 @@ export function harness({ start = Date.UTC(2026, 0, 5, 9, 0), user = USERS.en, f
     from = u;
   };
   const cardByWord = (w) => db._state.cards.find((c) => c.word === w);
-  return { bot, db, calls, send, press, last, all, buttons, labels, keyboard, clock, setUser, cardByWord, translatorCalls, dictionaryCalls };
+  const userState = (u = from) => db._state.users.get(u.id);
+  return { bot, db, calls, send, press, last, all, buttons, labels, keyboard, clock, setUser, cardByWord, userState, translatorCalls, dictionaryCalls, audioDownloads };
 }

@@ -7,7 +7,8 @@ import { createSupabaseDb } from './db/supabase.js';
 import { createMemoryDb } from './db/memory.js';
 import { startBackgroundLoop } from './reminders.js';
 import { setupProfile } from './setup.js';
-import { createTranslator, createDictionary } from './translate.js';
+import { createTranslator } from './translate.js';
+import { createDictionary, createAudioFetcher } from './dictionary.js';
 
 try {
   process.loadEnvFile(); // reads .env if present (Node >= 20.12)
@@ -33,7 +34,7 @@ if (env.DB === 'memory') {
 
 const translator = createTranslator({ email: env.MYMEMORY_EMAIL });
 const dictionary = createDictionary();
-const bot = createBot(token, db, { translator, dictionary });
+const bot = createBot(token, db, { translator, dictionary, fetchAudio: createAudioFetcher() });
 await setupProfile(bot.api);
 
 const stopBackground = startBackgroundLoop(bot.api, db, {

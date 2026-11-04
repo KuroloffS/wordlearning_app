@@ -39,8 +39,9 @@ export function createSupabaseDb(url, serviceKey) {
           p_username: from.username ?? null,
           p_first_name: from.first_name ?? null,
           p_language_code: from.language_code ?? null,
-          p_lang: defaults.lang ?? 'en',
-          p_translate_to: defaults.translate_to ?? null,
+          p_lang: defaults.lang ?? 'ru',
+          p_learn: defaults.learn ?? 'de',
+          p_tz_offset_min: defaults.tz_offset_min ?? 300,
           p_now: iso(now),
         }),
       );
@@ -106,7 +107,7 @@ export function createSupabaseDb(url, serviceKey) {
       const card = await this.getCard(userId, id);
       if (!card) return 'missing';
       const patch = { word: word.trim().slice(0, 200), translation: translation.trim().slice(0, 300), example: (example ?? '').trim().slice(0, 500) };
-      if (patch.word.toLowerCase() !== card.word.toLowerCase()) Object.assign(patch, { phonetic: '', audio_url: '', enriched: false });
+      if (patch.word.toLowerCase() !== card.word.toLowerCase()) Object.assign(patch, { phonetic: '', audio_url: '', audio_file_id: '', enriched: false });
       const { error } = await sb.from('cards').update(patch).eq('user_id', userId).eq('id', id);
       if (error?.code === '23505') return 'duplicate';
       if (error) throw new Error(`Supabase: ${error.message}`);
@@ -204,13 +205,20 @@ export function createSupabaseDb(url, serviceKey) {
       return check(await sb.from('cards').select('id, word').eq('enriched', false).order('created_at').limit(limit));
     },
 
-    async saveEnrichment(id, { phonetic = '', audio_url = '' }) {
-      check(
-        await sb
-          .from('cards')
-          .update({ phonetic: String(phonetic).slice(0, 100), audio_url: String(audio_url).slice(0, 500), enriched: true })
-          .eq('id', id),
-      );
+    /** Stores pronunciation data; `word` (e.g. with the article added) is skipped if the user already has that word. */
+    async saveEnrichment(id, { phonetic = '', audio_url = '', word }) {
+      const patch = { phonetic: String(phonetic).slice(0, 100), audio_url: String(audio_url).slice(0, 500), audio_file_id: '', enriched: true };
+      if (word) {
+        const { error } = await sb.from('cards').update({ ...patch, word: String(word).slice(0, 200) }).eq('id', id);
+        if (!error) return;
+        if (error.code !== '23505') throw new Error(`Supabase: ${error.message}`);
+      }
+      check(await sb.from('cards').update(patch).eq('id', id));
+    },
+
+    /** Remembers Telegram's file id of an uploaded pronunciation so it is not downloaded again. */
+    async saveAudioFileId(id, fileId) {
+      check(await sb.from('cards').update({ audio_file_id: String(fileId).slice(0, 200) }).eq('id', id));
     },
 
     async getAppState(key) {

@@ -1,9 +1,10 @@
 // Background work, run once a minute (Supabase cron → Edge Function, or a timer in the Node runner):
 //  - message users whose words are due for review
-//  - look up transcription/pronunciation for newly added English words
+//  - look up article, transcription and pronunciation for words added in bulk
 import { InlineKeyboard, GrammyError } from 'grammy';
 import { t, LANGS } from './i18n.js';
-import { englishCandidate, mapLimit } from './translate.js';
+import { langOf, mapLimit } from './translate.js';
+import { withArticle } from './dictionary.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -18,7 +19,7 @@ export async function sendReminders(api, db, { now = Date.now(), gapMin = 180, i
   let sent = 0;
   let failed = 0;
   for (const r of rows) {
-    const lang = LANGS.includes(r.lang) ? r.lang : 'en';
+    const lang = LANGS.includes(r.lang) ? r.lang : 'ru';
     const n = Number(r.due_count);
     try {
       await api.sendMessage(r.user_id, t(lang, 'reminder', n), {
@@ -44,18 +45,21 @@ export async function sendReminders(api, db, { now = Date.now(), gapMin = 180, i
 }
 
 /**
- * Looks up transcription + pronunciation audio for words added in bulk.
- * Words that aren't English (or have no entry) are marked done with empty values.
- * Network errors leave the card for a later pass.
+ * Looks up article, transcription and pronunciation for words added in bulk.
+ * German nouns get their article ("Haus" → "das Haus"). Words without a dictionary entry are
+ * marked done with empty values; network errors leave the card for a later pass.
  */
 export async function enrichCards(db, dictionary, { limit = 25 } = {}) {
   if (!dictionary) return { done: 0 };
   const cards = await db.cardsToEnrich(limit);
   let done = 0;
-  await mapLimit(cards, 4, async (c) => {
+  await mapLimit(cards, 3, async (c) => {
     try {
-      const r = englishCandidate(c.word) ? await dictionary(c.word) : null;
-      await db.saveEnrichment(c.id, { phonetic: r?.phonetic ?? '', audio_url: r?.audio_url ?? '' });
+      const e = await dictionary(c.word, langOf(c.word));
+      const patch = { phonetic: e?.ipa ?? '', audio_url: e?.audio_url ?? '' };
+      const word = withArticle(c.word, e);
+      if (word !== c.word) patch.word = word;
+      await db.saveEnrichment(c.id, patch);
       done++;
     } catch (e) {
       console.warn('Enrichment failed for', c.word, e.message);

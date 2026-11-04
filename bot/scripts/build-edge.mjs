@@ -20,6 +20,7 @@ export const EDGE_FILES = [
   ['bot/src/reminders.js', 'reminders.js'],
   ['bot/src/setup.js', 'setup.js'],
   ['bot/src/translate.js', 'translate.js'],
+  ['bot/src/dictionary.js', 'dictionary.js'],
   ['bot/src/db/supabase.js', 'db/supabase.js'],
 ];
 

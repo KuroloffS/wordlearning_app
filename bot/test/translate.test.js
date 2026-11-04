@@ -1,83 +1,48 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createTranslator, createDictionary, extractPronunciation, englishCandidate, mapLimit } from '../src/translate.js';
+import { createTranslator, splitArticle, stripArticle, hasArticle, langOf, mapLimit } from '../src/translate.js';
 
 const response = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 
-test('translator parses MyMemory responses', async () => {
+test('MyMemory: picks a usable candidate in the target language', async () => {
   const urls = [];
   const fetch = async (url) => {
     urls.push(url);
     const q = new URL(url).searchParams.get('q');
-    if (q === 'weather') return response(200, { responseStatus: 200, responseData: { translatedText: 'Ob-havo' } });
-    if (q === 'Paris') return response(200, { responseStatus: 200, responseData: { translatedText: 'Parij' } });
+    if (q === 'Haus') return response(200, { responseStatus: 200, responseData: { translatedText: 'Дом ' } });
+    if (q === 'дом')
+      return response(200, {
+        responseStatus: 200,
+        responseData: { translatedText: '   WOHNSITZ' },
+        matches: [{ translation: 'WOHNSITZ' }, { translation: 'дом' }, { translation: 'ein Zuhause' }, { translation: 'Haus' }],
+      });
     if (q === 'same') return response(200, { responseStatus: 200, responseData: { translatedText: 'Same' } });
-    if (q === 'quota') return response(200, { responseStatus: 429, quotaFinished: true, responseData: { translatedText: 'MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS' } });
-    if (q === 'quote') return response(200, { responseStatus: 200, responseData: { translatedText: 'it&#39;s &amp; ok' } });
+    if (q === 'quota') return response(200, { responseStatus: 429, quotaFinished: true, responseData: { translatedText: 'MYMEMORY WARNING' } });
+    if (q === 'quote') return response(200, { responseStatus: 200, responseData: { translatedText: 'это &amp; то' } });
     return response(500, {});
   };
   const translate = createTranslator({ fetch, email: 'bot@example.com' });
-  assert.equal(await translate('weather', 'uz'), 'ob-havo'); // casing follows the input
-  assert.equal(await translate('Paris', 'uz'), 'Parij');
-  assert.equal(await translate('same', 'en'), null); // identical → no translation
-  assert.equal(await translate('quota', 'uz'), null);
-  assert.equal(await translate('quote', 'uz'), "it's & ok");
-  assert.equal(await translate('x', 'not-a-lang'), null);
-  await assert.rejects(translate('error', 'uz'), /HTTP 500/);
+  assert.equal(await translate('Haus', 'ru', 'de'), 'дом'); // trimmed, lower-cased Russian noun
+  assert.equal(await translate('дом', 'de', 'ru'), 'ein Zuhause'); // shouting and wrong-script candidates skipped
+  assert.equal(await translate('same', 'de', 'ru'), null);
+  assert.equal(await translate('quota', 'ru', 'de'), null);
+  assert.equal(await translate('quote', 'ru', 'de'), 'это & то');
+  await assert.rejects(translate('error', 'ru', 'de'), /HTTP 500/);
   const u = new URL(urls[0]);
-  assert.equal(u.searchParams.get('langpair'), 'Autodetect|uz');
+  assert.equal(u.searchParams.get('langpair'), 'de|ru');
   assert.equal(u.searchParams.get('de'), 'bot@example.com');
 });
 
-const APPLE = [
-  {
-    word: 'apple',
-    phonetic: '/ˈæp.əl/',
-    phonetics: [
-      { text: '/ˈæp.əl/', audio: 'https://api.dictionaryapi.dev/media/pronunciations/en/apple-uk.mp3' },
-      { text: '/ˈæp.əl/', audio: 'https://api.dictionaryapi.dev/media/pronunciations/en/apple-us.mp3' },
-    ],
-  },
-];
-
-test('pronunciation extraction prefers US audio', () => {
-  assert.deepEqual(extractPronunciation(APPLE), {
-    phonetic: '/ˈæp.əl/',
-    audio_url: 'https://api.dictionaryapi.dev/media/pronunciations/en/apple-us.mp3',
-  });
-  assert.deepEqual(extractPronunciation([{ phonetics: [{ text: '/ˈbɒɹəʊ/', audio: '' }, { audio: '//ssl.gstatic.com/x-uk.mp3' }] }]), {
-    phonetic: '/ˈbɒɹəʊ/',
-    audio_url: 'https://ssl.gstatic.com/x-uk.mp3',
-  });
-  assert.equal(extractPronunciation([{ phonetics: [] }]), null);
-  assert.equal(extractPronunciation({ title: 'No Definitions Found' }), null);
-});
-
-test('dictionary client', async () => {
-  const seen = [];
-  const fetch = async (url) => {
-    seen.push(decodeURIComponent(url.split('/').pop()));
-    if (url.endsWith('/apple')) return response(200, APPLE);
-    if (url.endsWith('/busy')) return response(429, {});
-    return response(404, { title: 'No Definitions Found' });
-  };
-  const lookup = createDictionary({ fetch });
-  assert.equal((await lookup('Apple')).phonetic, '/ˈæp.əl/');
-  assert.equal(await lookup('qwzx'), null);
-  assert.equal(await lookup('яблоко'), null); // not looked up at all
-  await assert.rejects(lookup('busy'), /429/);
-  assert.deepEqual(seen, ['apple', 'qwzx', 'busy']);
-});
-
-test('englishCandidate', () => {
-  assert.equal(englishCandidate('to borrow'), 'borrow');
-  assert.equal(englishCandidate('The Weather'), 'weather');
-  assert.equal(englishCandidate('give up'), 'give up');
-  assert.equal(englishCandidate("don't"), "don't");
-  assert.equal(englishCandidate('ob-havo'), 'ob-havo');
-  assert.equal(englishCandidate('яблоко'), null);
-  assert.equal(englishCandidate('a very long phrase here'), null);
-  assert.equal(englishCandidate('word123'), null);
+test('language and article helpers', () => {
+  assert.equal(langOf('Haus'), 'de');
+  assert.equal(langOf('дом'), 'ru');
+  assert.equal(langOf('ob-havo'), 'de');
+  assert.deepEqual(splitArticle('Das Haus'), { article: 'das', rest: 'Haus' });
+  assert.deepEqual(splitArticle('Haus'), { article: '', rest: 'Haus' });
+  assert.equal(stripArticle('die Katze'), 'Katze');
+  assert.equal(stripArticle('Diesel'), 'Diesel');
+  assert.equal(hasArticle('der Hund'), true);
+  assert.equal(hasArticle('derb'), false);
 });
 
 test('mapLimit keeps order and limits concurrency', async () => {

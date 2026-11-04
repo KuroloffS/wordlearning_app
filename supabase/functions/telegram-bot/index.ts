@@ -2,7 +2,7 @@
 //
 //   POST /functions/v1/telegram-bot                 Telegram webhook (checked with a secret token)
 //   POST /functions/v1/telegram-bot?action=tick     every minute from pg_cron: sets up the webhook once
-//                                                   BOT_TOKEN exists, sends reminders, looks up pronunciations
+//                                                   BOT_TOKEN exists, sends reminders, looks up articles/pronunciations
 //   POST /functions/v1/telegram-bot?action=simulate self-test with fake Telegram + test users (negative ids)
 //   GET  /functions/v1/telegram-bot                 health check
 //
@@ -16,9 +16,10 @@ import { createBot } from './lib/bot.js';
 import { createSupabaseDb } from './lib/db/supabase.js';
 import { enrichCards, sendReminders } from './lib/reminders.js';
 import { ensureWebhook } from './lib/setup.js';
-import { createDictionary, createTranslator } from './lib/translate.js';
+import { createTranslator } from './lib/translate.js';
+import { createAudioFetcher, createDictionary } from './lib/dictionary.js';
 
-const VERSION = '2026-11-04.2';
+const VERSION = '2026-11-04.3';
 const FUNCTION_NAME = 'telegram-bot';
 const SUPABASE_URL = (Deno.env.get('SUPABASE_URL') ?? '').replace(/\/+$/, '');
 const WEBHOOK_URL = Deno.env.get('WEBHOOK_URL') ?? `${SUPABASE_URL}/functions/v1/${FUNCTION_NAME}`;
@@ -45,6 +46,7 @@ function serviceKey(): string {
 const db = createSupabaseDb(SUPABASE_URL, serviceKey());
 const translator = createTranslator({ email: Deno.env.get('MYMEMORY_EMAIL') });
 const dictionary = createDictionary();
+const fetchAudio = createAudioFetcher();
 
 async function sha256Hex(text: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -71,7 +73,7 @@ async function getLive(): Promise<Live | null> {
   if (live?.token === token) return live;
   const secret = await sha256Hex(`webhook:${token}`);
   const tokenId = (await sha256Hex(`id:${token}`)).slice(0, 16);
-  const bot = createBot(token, db, { translator, dictionary });
+  const bot = createBot(token, db, { translator, dictionary, fetchAudio });
   const handle = webhookCallback(bot, 'std/http', { secretToken: secret, timeoutMilliseconds: 50_000 }) as any;
   live = { token, bot, handle, secret, tokenId };
   return live;
@@ -145,6 +147,7 @@ async function simulate(body: any) {
   const bot = createBot('0:SIMULATION', db, {
     translator,
     dictionary,
+    fetchAudio,
     botInfo: TEST_BOT_INFO,
     onError: (err: any) => errors.push(String(err?.error?.stack ?? err?.error ?? err)),
   });

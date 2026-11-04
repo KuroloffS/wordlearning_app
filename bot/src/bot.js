@@ -7,6 +7,7 @@ import {
   isNew,
   cardStatus,
   gradeTypedAnswer,
+  normalizeAnswer,
   parseBulk,
 } from '../../js/srs.js';
 import { startOfLocalDay, localTime, formatOffset, parseOffset, streakFromDays } from './time.js';
@@ -15,25 +16,26 @@ import {
   tRaw,
   esc,
   LANGS,
+  LEARN,
   LANG_NAMES,
   LANG_FLAGS,
   MENU,
   menuLabels,
   isMenuLabel,
   pickLang,
-  pickTranslateTo,
+  pickLearn,
   fmtInterval,
-  TRANSLATE_TARGETS,
   weekday,
 } from './i18n.js';
-import { SAMPLES } from './samples.js';
-import { englishCandidate, mapLimit } from './translate.js';
+import { samplesFor } from './samples.js';
+import { mapLimit, langOf, stripArticle } from './translate.js';
+import { withArticle } from './dictionary.js';
 
 const INTERVALS = DEFAULT_INTERVALS;
 const MAX_STAGE = INTERVALS.length;
 const PAGE_SIZE = 20;
 export const MAX_IMPORT = 500;
-const MAX_AUTO_TRANSLATE = 20; // per message, to stay within the free translation quota
+const MAX_AUTO_TRANSLATE = 20; // per message, to stay within the free API quotas
 const MAX_SYNC_ENRICH = 3; // look up pronunciation right away for small additions; bigger batches are done in the background
 const QUIET_PRESETS = [[23, 8], [22, 8], [0, 9], [21, 7], [0, 0]];
 const GRADE_ICONS = ['❌', '😐', '✅', '🚀'];
@@ -42,7 +44,7 @@ const DIRS = ['forward', 'reverse', 'mixed'];
 const ID = '([0-9a-f-]{36})';
 
 export function mainKeyboard(lang) {
-  const m = MENU[lang] ?? MENU.en;
+  const m = MENU[lang] ?? MENU.ru;
   return new Keyboard().text(m.review).text(m.add).row().text(m.stats).text(m.list).text(m.settings).resized().persistent();
 }
 
@@ -63,10 +65,23 @@ export function looksLikeWord(line) {
   return line.length <= 60 && line.split(/\s+/).length <= 6 && /\p{L}/u.test(line) && !/https?:\/\//i.test(line);
 }
 
+/** Typed answers: a German noun without (or with the wrong) article counts as "almost". */
+export function gradeAnswer(input, expected) {
+  const g = gradeTypedAnswer(input, expected);
+  if (g !== GRADES.AGAIN) return g;
+  const bare = (s) => normalizeAnswer(stripArticle(s));
+  const variants = String(expected).split(/[,;/]/).map(bare).filter(Boolean);
+  return variants.includes(bare(input)) ? GRADES.HARD : g;
+}
+
+/** Puts a manual "word - translation" pair the right way round: the word is in the language being learned. */
+export function orient(item, learn) {
+  if (langOf(item.word) !== learn && langOf(item.translation) === learn) return { ...item, word: item.translation, translation: item.word };
+  return item;
+}
+
 /**
  * Builds the bot. `db` is db/supabase.js or db/memory.js.
- * Options: clock() → ms, botInfo (skips getMe), random() for tests,
- * translator(text, to) and dictionary(word) from translate.js (optional), onError(err).
  * @param {string} token
  * @param {any} db
  * @param {{
@@ -74,16 +89,22 @@ export function looksLikeWord(line) {
  *   botInfo?: any,
  *   random?: () => number,
  *   translator?: ((text: string, to: string, from?: string) => Promise<string | null>) | null,
- *   dictionary?: ((word: string) => Promise<{ phonetic: string, audio_url: string } | null>) | null,
+ *   dictionary?: ((text: string, lang?: string) => Promise<any>) | null,
+ *   fetchAudio?: ((url: string) => Promise<Uint8Array>) | null,
  *   onError?: (err: any) => void,
  * }} [options]
  */
-export function createBot(token, db, { clock = Date.now, botInfo, random = Math.random, translator = null, dictionary = null, onError } = {}) {
+export function createBot(
+  token,
+  db,
+  { clock = Date.now, botInfo, random = Math.random, translator = null, dictionary = null, fetchAudio = null, onError } = {},
+) {
   const bot = new Bot(token, botInfo ? { botInfo } : undefined);
 
   const T = (ctx, key, ...a) => t(ctx.lang, key, ...a);
   const HTML = { parse_mode: 'HTML', link_preview_options: { is_disabled: true } };
   const reply = (ctx, text, extra = {}) => ctx.reply(text, { ...HTML, ...extra });
+  const learnOf = (ctx) => (ctx.user.learn === 'ru' ? 'ru' : 'de');
 
   /** Edits the message with the pressed button; if Telegram refuses (e.g. too old), sends a new one. */
   async function safeEdit(ctx, text, extra = {}) {
@@ -103,11 +124,9 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
       if (ctx.message?.text?.startsWith('/start')) await ctx.reply(t(pickLang(ctx.from.language_code), 'private_only'));
       return;
     }
-    ctx.user = await db.touchUser(ctx.from, clock(), {
-      lang: pickLang(ctx.from.language_code),
-      translate_to: pickTranslateTo(ctx.from.language_code),
-    });
-    ctx.lang = LANGS.includes(ctx.user.lang) ? ctx.user.lang : 'en';
+    const lang = pickLang(ctx.from.language_code);
+    ctx.user = await db.touchUser(ctx.from, clock(), { lang, learn: pickLearn(lang), tz_offset_min: lang === 'de' ? 60 : 300 });
+    ctx.lang = LANGS.includes(ctx.user.lang) ? ctx.user.lang : 'ru';
     // Leaving a question (typed answer / edit) by pressing a menu button or sending a command cancels it.
     const text = ctx.message?.text;
     if (ctx.user.pending && text && (text.startsWith('/') || isMenuLabel(text))) await setPending(ctx, null);
@@ -129,6 +148,71 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
   }
   const audioKb = (c) => (c.audio_url ? new InlineKeyboard().text('🔊', `p:${c.id}`) : undefined);
 
+  // ---------- dictionary helpers ----------
+  /** Dictionary entry, null when the word isn't in the dictionary, undefined when the lookup failed (retry later). */
+  const look = (text, lang) =>
+    dictionary
+      ? dictionary(text, lang).catch((e) => {
+          console.warn('Dictionary lookup failed:', e.message);
+          return undefined;
+        })
+      : Promise.resolve(null);
+  const machine = (text, to, from) =>
+    translator
+      ? translator(text, to, from).catch((e) => {
+          console.warn('Translation failed:', e.message);
+          return null;
+        })
+      : Promise.resolve(null);
+
+  /** Builds a card from a single German or Russian word: translation, article, IPA and audio. */
+  async function autoCard(text, learn) {
+    let de = '';
+    let ru = '';
+    let deEntry = null;
+    let ruEntry = null;
+    let ruLooked = false;
+    if (langOf(text) === 'de') {
+      deEntry = await look(text, 'de');
+      de = deEntry?.headword || text.trim();
+      ru = deEntry?.translations?.slice(0, 2).join(', ') || (await machine(stripArticle(text), 'ru', 'de')) || '';
+    } else {
+      ruEntry = await look(text, 'ru');
+      ruLooked = true;
+      ru = ruEntry?.lemma || text.trim().toLowerCase();
+      const deWord = ruEntry?.translations?.[0] || (await machine(text, 'de', 'ru')) || '';
+      if (deWord) {
+        deEntry = await look(deWord, 'de');
+        de = deEntry?.headword || deWord;
+      }
+    }
+    if (!de || !ru || de.toLowerCase() === ru.toLowerCase()) return null;
+    if (learn === 'ru') {
+      if (!ruLooked) ruEntry = await look(ru.split(',')[0].trim(), 'ru');
+      return { word: ru, translation: de, example: '', phonetic: ruEntry?.ipa ?? '', audio_url: ruEntry?.audio_url ?? '', enriched: ruEntry !== undefined };
+    }
+    return { word: de, translation: ru, example: '', phonetic: deEntry?.ipa ?? '', audio_url: deEntry?.audio_url ?? '', enriched: deEntry !== undefined };
+  }
+
+  /** Adds article/IPA/audio to manual items (mutates). Failed lookups leave enriched=false so the background job retries. */
+  async function enrichItems(items) {
+    await mapLimit(items, 3, async (it) => {
+      if (!dictionary) return;
+      const e = await look(it.word, langOf(it.word));
+      if (e === undefined) return;
+      Object.assign(it, { word: withArticle(it.word, e), phonetic: e?.ipa ?? '', audio_url: e?.audio_url ?? '', enriched: true });
+    });
+  }
+
+  async function enrichCard(card) {
+    const it = { word: card.word };
+    await enrichItems([it]);
+    if (!it.enriched) return null;
+    const patch = { phonetic: it.phonetic, audio_url: it.audio_url, ...(it.word !== card.word ? { word: it.word } : {}) };
+    await db.saveEnrichment(card.id, patch);
+    return db.getCard(card.user_id, card.id);
+  }
+
   // ---------- start / help ----------
   bot.command('start', async (ctx) => {
     await reply(ctx, `${T(ctx, 'greet', ctx.from.first_name || '🙂')}\n\n${T(ctx, 'help')}`, { reply_markup: mainKeyboard(ctx.lang) });
@@ -146,26 +230,16 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
   bot.hears(menuLabels('add'), addHelp);
 
   // ---------- sample words ----------
-  async function addSamples(ctx, set) {
-    const added = await db.addCards(ctx.user.id, parseBulk(SAMPLES[set]), clock());
+  async function addSamples(ctx) {
+    const added = await db.addCards(ctx.user.id, samplesFor(learnOf(ctx)), clock());
     return reply(ctx, T(ctx, 'samples_added', added.length), {
       reply_markup: new InlineKeyboard().text(T(ctx, 'btn_start_learning'), 'review'),
     });
   }
-  async function offerSamples(ctx) {
-    if (ctx.lang === 'ru' || ctx.lang === 'uz') return addSamples(ctx, ctx.lang);
-    return reply(ctx, T(ctx, 'choose_samples'), {
-      reply_markup: new InlineKeyboard().text('🇬🇧 → 🇺🇿 English – Oʻzbekcha', 'sample:uz').row().text('🇬🇧 → 🇷🇺 English – Русский', 'sample:ru'),
-    });
-  }
-  bot.command('sample', offerSamples);
+  bot.command('sample', addSamples);
   bot.callbackQuery('sample', async (ctx) => {
     await ctx.answerCallbackQuery();
-    await offerSamples(ctx);
-  });
-  bot.callbackQuery(/^sample:(uz|ru)$/, async (ctx) => {
-    await ctx.answerCallbackQuery();
-    await addSamples(ctx, ctx.match[1]);
+    await addSamples(ctx);
   });
 
   // ---------- review ----------
@@ -330,20 +404,32 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
     await sendNextCard(ctx);
   });
 
-  // Pronunciation
+  // Pronunciation: reuse Telegram's copy if we have one, otherwise download the recording and upload it.
   bot.callbackQuery(new RegExp(`^p:${ID}$`), async (ctx) => {
     const card = await db.getCard(ctx.user.id, ctx.match[1]);
     if (!card?.audio_url) return ctx.answerCallbackQuery({ text: T(ctx, 'no_audio') });
     await ctx.answerCallbackQuery();
-    try {
-      await ctx.replyWithVoice(card.audio_url);
-    } catch {
+    if (card.audio_file_id) {
       try {
-        await ctx.replyWithAudio(card.audio_url, { title: card.word });
-      } catch (e) {
-        console.warn('Pronunciation failed:', e.description ?? e.message);
-        await reply(ctx, T(ctx, 'no_audio'));
+        await ctx.replyWithVoice(card.audio_file_id);
+        return;
+      } catch {
+        // stale file id: upload again below
       }
+    }
+    try {
+      const bytes = fetchAudio ? await fetchAudio(card.audio_url) : null;
+      const file = bytes ? new InputFile(bytes, 'pronunciation.mp3') : card.audio_url;
+      try {
+        const msg = await ctx.replyWithVoice(file);
+        const fileId = msg?.voice?.file_id;
+        if (fileId) await db.saveAudioFileId(card.id, fileId);
+      } catch {
+        await ctx.replyWithAudio(bytes ? new InputFile(bytes, `${card.word}.mp3`) : card.audio_url, { title: card.word });
+      }
+    } catch (e) {
+      console.warn('Pronunciation failed:', e.description ?? e.message);
+      await reply(ctx, T(ctx, 'no_audio'));
     }
   });
 
@@ -418,8 +504,9 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
   });
 
   async function handleEdit(ctx, pending, text) {
-    const [item] = parseBulk(text.split(/\r?\n/)[0]);
-    if (!item) return reply(ctx, T(ctx, 'edit_bad'));
+    const [parsed] = parseBulk(text.split(/\r?\n/)[0]);
+    if (!parsed) return reply(ctx, T(ctx, 'edit_bad'));
+    const item = orient(parsed, learnOf(ctx));
     const res = await db.updateCardText(ctx.user.id, pending.card_id, item);
     if (res === 'duplicate') return reply(ctx, T(ctx, 'edit_duplicate', item.word));
     await setPending(ctx, null);
@@ -427,31 +514,6 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
     let card = await db.getCard(ctx.user.id, pending.card_id);
     if (card && !card.enriched) card = (await enrichCard(card)) ?? card;
     return reply(ctx, `${T(ctx, 'edit_saved')}\n\n${cardText(card, false)}`, { reply_markup: cardButtons(ctx, card) });
-  }
-
-  // ---------- pronunciation lookups ----------
-  /** Adds phonetic/audio_url/enriched to word items (mutates). Lookup errors leave enriched=false so the background job retries. */
-  async function enrichItems(items) {
-    await mapLimit(items, 3, async (it) => {
-      if (!dictionary || !englishCandidate(it.word)) {
-        it.enriched = !!dictionary;
-        return;
-      }
-      try {
-        const r = await dictionary(it.word);
-        Object.assign(it, { phonetic: r?.phonetic ?? '', audio_url: r?.audio_url ?? '', enriched: true });
-      } catch (e) {
-        console.warn('Dictionary lookup failed:', e.message);
-      }
-    });
-  }
-
-  async function enrichCard(card) {
-    const it = { word: card.word };
-    await enrichItems([it]);
-    if (!it.enriched) return null;
-    await db.saveEnrichment(card.id, { phonetic: it.phonetic ?? '', audio_url: it.audio_url ?? '' });
-    return { ...card, phonetic: it.phonetic ?? '', audio_url: it.audio_url ?? '', enriched: true };
   }
 
   // ---------- stats ----------
@@ -491,10 +553,11 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
     const u = ctx.user;
     const L = ctx.lang;
     const quiet = u.quiet_start === u.quiet_end ? t(L, 'off') : `${pad2(u.quiet_start)}:00–${pad2(u.quiet_end)}:00`;
-    const translate = u.translate_to ? (TRANSLATE_TARGETS[u.translate_to] ?? u.translate_to) : t(L, 'off');
     const mode = t(L, `mode_${MODES.includes(u.mode) ? u.mode : 'flip'}`);
     const dir = t(L, `dir_${DIRS.includes(u.direction) ? u.direction : 'forward'}`);
+    const learn = t(L, `learn_${learnOf(ctx)}`);
     const text = tRaw(L, 'settings', {
+      learn,
       mode,
       dir,
       perDay: u.new_per_day,
@@ -502,10 +565,13 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
       quiet,
       tz: formatOffset(u.tz_offset_min),
       time: localTime(clock(), u.tz_offset_min),
-      translate: esc(translate),
+      translate: t(L, u.auto_translate ? 'on' : 'off'),
       lang: LANG_NAMES[L],
     });
     const kb = new InlineKeyboard()
+      .text(`🎓 ${learn}`, 'set:learn')
+      .text(t(L, u.auto_translate ? 'btn_translate_on' : 'btn_translate_off'), 'set:tr')
+      .row()
       .text(`🎴 ${mode}`, 'set:mode')
       .text(`🔀 ${dir}`, 'set:dir')
       .row()
@@ -520,7 +586,6 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
       .text(`🌍 ${formatOffset(u.tz_offset_min)}`, 'set:noop')
       .text('➕1h', 'set:tz:60')
       .row()
-      .text(`🔤 ${translate}`, 'set:tr')
       .text(`🌐 ${LANG_FLAGS[L]} ${LANG_NAMES[L]}`, 'set:lang')
       .row()
       .text(t(L, 'btn_wipe'), 'wipe');
@@ -540,11 +605,13 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
 
   const cycle = (list, cur) => list[(list.indexOf(cur) + 1) % list.length];
 
-  bot.callbackQuery(/^set:(mode|dir|new|remind|tz|quiet|noop)(?::(-?\d+))?$/, async (ctx) => {
+  bot.callbackQuery(/^set:(learn|tr|mode|dir|new|remind|tz|quiet|noop)(?::(-?\d+))?$/, async (ctx) => {
     const u = ctx.user;
     const [, key, arg] = ctx.match;
     const patch = {};
-    if (key === 'mode') patch.mode = cycle(MODES, u.mode);
+    if (key === 'learn') patch.learn = cycle(LEARN, learnOf(ctx));
+    else if (key === 'tr') patch.auto_translate = !u.auto_translate;
+    else if (key === 'mode') patch.mode = cycle(MODES, u.mode);
     else if (key === 'dir') patch.direction = cycle(DIRS, u.direction);
     else if (key === 'new') patch.new_per_day = Math.max(0, Math.min(500, u.new_per_day + Number(arg)));
     else if (key === 'remind') patch.remind = !u.remind;
@@ -573,7 +640,7 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
     await safeEdit(ctx, T(ctx, 'choose_lang'), { reply_markup: kb });
   });
 
-  bot.callbackQuery(/^lang:(en|ru|uz)$/, async (ctx) => {
+  bot.callbackQuery(/^lang:(ru|de)$/, async (ctx) => {
     const lang = ctx.match[1];
     await db.updateUser(ctx.user.id, { lang });
     ctx.user.lang = lang;
@@ -581,26 +648,6 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
     await ctx.answerCallbackQuery();
     await showSettings(ctx);
     await reply(ctx, T(ctx, 'lang_set'), { reply_markup: mainKeyboard(lang) });
-  });
-
-  bot.callbackQuery('set:tr', async (ctx) => {
-    await ctx.answerCallbackQuery();
-    const kb = new InlineKeyboard();
-    Object.entries(TRANSLATE_TARGETS).forEach(([code, name], i) => {
-      kb.text(`${ctx.user.translate_to === code ? '✓ ' : ''}${name}`, `tr:${code}`);
-      if (i % 2 === 1) kb.row();
-    });
-    kb.row().text(T(ctx, 'btn_translate_off'), 'tr:off').row().text(T(ctx, 'btn_back'), 'set:back');
-    await safeEdit(ctx, T(ctx, 'choose_translate'), { reply_markup: kb });
-  });
-
-  bot.callbackQuery(/^tr:([a-z]{2}|off)$/, async (ctx) => {
-    const code = ctx.match[1] === 'off' ? null : ctx.match[1];
-    if (code && !TRANSLATE_TARGETS[code]) return ctx.answerCallbackQuery();
-    await db.updateUser(ctx.user.id, { translate_to: code });
-    ctx.user.translate_to = code;
-    await ctx.answerCallbackQuery();
-    await showSettings(ctx);
   });
 
   bot.command('timezone', async (ctx) => {
@@ -639,7 +686,7 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
           .join(','),
       );
     }
-    // The BOM makes Excel open UTF-8 (Cyrillic, Uzbek letters) correctly.
+    // The BOM makes Excel open UTF-8 (Cyrillic, umlauts) correctly.
     const bytes = new TextEncoder().encode('﻿' + rows.join('\n'));
     await ctx.replyWithDocument(new InputFile(bytes, 'my-words.csv'), { caption: T(ctx, 'export_caption', cards.length) });
   });
@@ -650,7 +697,7 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
     const card = await db.getCard(ctx.user.id, pending.card_id);
     if (card && card.reps === pending.reps) {
       const expected = pending.rev ? card.word : card.translation;
-      const g = gradeTypedAnswer(text, expected);
+      const g = gradeAnswer(text, expected);
       const result = await applyGrade(card, g);
       if (result) {
         const verdict = g === GRADES.GOOD ? T(ctx, 'typed_correct') : g === GRADES.HARD ? T(ctx, 'typed_almost', expected) : T(ctx, 'typed_wrong', expected);
@@ -661,17 +708,6 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
     return sendNextCard(ctx);
   }
 
-  /** Translates a bare word. If it is already in the target language, learns its English equivalent instead. */
-  async function autoTranslate(word, target) {
-    const tr = await translator(word, target);
-    if (tr) return { word, translation: tr, example: '' };
-    if (target !== 'en') {
-      const en = await translator(word, 'en');
-      if (en && en.toLowerCase() !== word.toLowerCase()) return { word: en, translation: word, example: '' };
-    }
-    return null;
-  }
-
   async function addWordsFromText(ctx, text) {
     const lines = text
       .split(/\r?\n/)
@@ -679,30 +715,25 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
       .filter((s) => s && !s.startsWith('#'));
     if (lines.length > MAX_IMPORT) return reply(ctx, T(ctx, 'too_many', lines.length, MAX_IMPORT));
 
+    const learn = learnOf(ctx);
     const items = [];
     const bare = [];
     for (const line of lines) {
       const [item] = parseBulk(line);
-      if (item) items.push(item);
+      if (item) items.push(orient(item, learn));
       else if (looksLikeWord(line)) bare.push(line);
     }
     if (!items.length && !bare.length) return reply(ctx, T(ctx, 'nothing_parsed'));
 
-    const target = ctx.user.translate_to;
     const auto = [];
     const failed = [];
     let hint = false;
     if (bare.length) {
-      if (!target || !translator) hint = true;
+      if (!ctx.user.auto_translate || (!dictionary && !translator)) hint = true;
       else {
         const todo = bare.slice(0, MAX_AUTO_TRANSLATE);
         failed.push(...bare.slice(MAX_AUTO_TRANSLATE));
-        const results = await mapLimit(todo, 4, (w) =>
-          autoTranslate(w, target).catch((e) => {
-            console.warn('Translation failed:', e.message);
-            return null;
-          }),
-        );
+        const results = await mapLimit(todo, 3, (w) => autoCard(w, learn));
         results.forEach((r, i) => (r ? auto.push(r) : failed.push(todo[i])));
       }
     }
@@ -711,8 +742,8 @@ export function createBot(token, db, { clock = Date.now, botInfo, random = Math.
       return reply(ctx, hint ? T(ctx, 'translate_off_hint') : T(ctx, 'not_translated', failedText));
     }
 
+    if (items.length <= MAX_SYNC_ENRICH) await enrichItems(items);
     const all = [...items, ...auto];
-    if (all.length <= MAX_SYNC_ENRICH) await enrichItems(all);
     const added = await db.addCards(ctx.user.id, all, clock());
     const autoWords = new Set(auto.map((a) => a.word.toLowerCase()));
     const isAuto = (c) => autoWords.has(c.word.toLowerCase());
